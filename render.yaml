@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: plant-production-dashboard
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.5
+      - key: SUPABASE_DATABASE_URL
+        sync: false
+      - key: APP_USERNAME
+        value: admin
+      - key: APP_ADMIN_EMAIL
+        sync: false
+      - key: APP_PASSWORD
+        sync: false
+      - key: PLANT_TIMEZONE
+        value: America/Chicago
+      - key: EMAIL_ENABLED
+        value: "false"

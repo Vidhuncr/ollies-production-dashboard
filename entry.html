@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Team Entry | Ollies Production</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body class="entryBody">
+<header class="entryHeader">
+  <div>
+    <h1>Ollies Production — Team Entry</h1>
+    <p>Choose one task, enter the information, and save.</p>
+  </div>
+  <div class="entryAccount"><span id="signedInAs"></span><a id="fullSystem" href="/" hidden>Full dashboard</a><a href="/logout">Sign Out</a></div>
+</header>
+
+<main class="entryWrap">
+  <section id="taskMenu">
+    <div class="entryIntro"><span>What are you entering?</span><small>For an order, use Manufacture, Tint Packaged Product, or both. Every entry reduces the same remaining need.</small></div>
+    <div class="entryTasks">
+      <button type="button" class="entryTask" data-panel="orderPanel"><i>1</i><b>Add an Order Need</b><span>With an S# or without an S#</span></button>
+      <button type="button" class="entryTask" data-panel="productionPanel"><i>2</i><b>Manufacture Product</b><span>Reduces the selected order’s remaining need</span></button>
+      <button type="button" class="entryTask" data-panel="requirementPanel"><i>3</i><b>Packaging Requirement</b><span>Enter the packages an order needs</span></button>
+      <button type="button" class="entryTask" data-panel="packagePanel"><i>4</i><b>Record Packaging</b><span>Add completed packages to inventory</span></button>
+      <button type="button" class="entryTask rework" data-panel="reworkPanel"><i>5</i><b>Tint Packaged Product</b><span>Also reduces the same order’s remaining need</span></button>
+    </div>
+  </section>
+
+  <section id="orderPanel" class="entryPanel" hidden>
+    <button type="button" class="entryBack">← Choose another task</button>
+    <div class="entryCard">
+      <div class="entryTitle"><i>1</i><div><h2>Add an Order Need</h2><p>Use “With S#” for a customer order. Use “No S# Yet” when the S# is not available.</p></div></div>
+      <div class="entrySegment" id="orderMode"><button type="button" class="selected" data-mode="s">With S#</button><button type="button" data-mode="stock">No S# Yet</button></div>
+      <form id="orderEntryForm" class="entryForm">
+        <label id="sNumberField"><span>S#</span><input id="entrySNumber" name="s_number" placeholder="S12345" pattern="[Ss][0-9]{5}" maxlength="6" required><small>S followed by exactly 5 digits</small></label>
+        <label><span>Category</span><select id="entryOrderCategory" name="brand" required></select></label>
+        <label><span>Color</span><select id="entryOrderColor" name="color" required></select></label>
+        <label><span id="entryOrderAmountLabel">Gallons needed</span><input id="entryOrderAmount" name="amount" type="number" min="0.01" step="0.01" required></label>
+        <label><span>Ship month</span><input id="entryShipMonth" name="ship_month" type="month" required><small>Month this order is expected to ship</small></label>
+        <fieldset id="recipientField"><legend>Email when production is recorded <small>(optional)</small></legend><div id="entryRecipients" class="entryChecks"></div></fieldset>
+        <button class="entrySave">Save Order Need</button>
+      </form>
+    </div>
+  </section>
+
+  <section id="productionPanel" class="entryPanel" hidden>
+    <button type="button" class="entryBack">← Choose another task</button>
+    <div class="entryCard">
+      <div class="entryTitle"><i>2</i><div><h2>Manufacture Product</h2><p>Select the order and enter the amount manufactured. You may combine this with tinted packaged product.</p></div></div>
+      <div class="entryTargetPrompt"><b>What is this manufacturing for?</b><span>Select the exact order or choose Future Stock.</span></div>
+      <div class="entrySegment" id="productionMode"><button type="button" class="selected" data-mode="s">Customer Order (S# or No S#)</button><button type="button" data-mode="stock">Future Stock</button></div>
+      <form id="productionEntryForm" class="entryForm">
+        <label id="productionOrderField" class="entryWide"><span>Producing for</span><select id="entryProductionOrder" required></select><small id="productionOrderHelp"></small></label>
+        <div id="productionStockFields" class="entrySubgrid" hidden>
+          <label><span>Future-stock category</span><select id="entryProductionCategory" required></select></label>
+          <label><span>Future-stock color</span><select id="entryProductionColor" required></select></label>
+          <div id="productionStockHelp" class="entryHelp entryWide"></div>
+        </div>
+        <label><span>Batch #</span><input id="entryBatch" required></label>
+        <label><span id="entryProductionAmountLabel">Amount produced</span><input id="entryProductionAmount" type="number" min="0.01" step="0.01" required></label>
+        <label><span>Labor rate</span><select id="entryProductionRate" required></select></label>
+        <label><span>Labor hours</span><input id="entryProductionHours" type="number" min="0.01" step="0.01" required></label>
+        <button class="entrySave">Save Manufactured Amount</button>
+      </form>
+    </div>
+  </section>
+
+  <section id="requirementPanel" class="entryPanel" hidden>
+    <button type="button" class="entryBack">← Choose another task</button>
+    <div class="entryCard">
+      <div class="entryTitle"><i>3</i><div><h2>Enter Packaging Requirement</h2><p>Tell the system how this order must be packed.</p></div></div>
+      <form id="requirementEntryForm" class="entryForm">
+        <label class="entryWide"><span>Order line</span><select id="entryRequirementOrder" required></select></label>
+        <label><span>Package type</span><select id="entryRequirementType" required></select></label>
+        <label id="requirementCaseField" hidden><span>Pieces in each case</span><input id="entryRequirementCaseSize" type="number" min="1" step="1"></label>
+        <label><span>Number of packages needed</span><input id="entryRequirementCount" type="number" min="1" step="1" required></label>
+        <div id="entryRequirementHelp" class="entryHelp entryWide"></div>
+        <button class="entrySave">Save Packaging Requirement</button>
+      </form>
+    </div>
+  </section>
+
+  <section id="packagePanel" class="entryPanel" hidden>
+    <button type="button" class="entryBack">← Choose another task</button>
+    <div class="entryCard">
+      <div class="entryTitle"><i>4</i><div><h2>Record Completed Packaging</h2><p>Select produced product and enter the packages completed.</p></div></div>
+      <form id="packageEntryForm" class="entryForm">
+        <label class="entryWide"><span>Produced product</span><select id="entryPackageSource" required></select><small id="entryPackageAvailable"></small></label>
+        <label><span>Package type</span><select id="entryPackageType" required></select></label>
+        <label id="packageCaseField" hidden><span>Pieces in each case</span><input id="entryPackageCaseSize" type="number" min="1" step="1"></label>
+        <label><span>Number of packages completed</span><input id="entryPackageCount" type="number" min="1" step="1" required></label>
+        <label><span>Labor rate</span><select id="entryPackageRate" required></select></label>
+        <label><span>Labor hours</span><input id="entryPackageHours" type="number" min="0.01" step="0.01" required></label>
+        <button class="entrySave">Save Completed Packaging</button>
+      </form>
+    </div>
+  </section>
+
+  <section id="reworkPanel" class="entryPanel" hidden>
+    <button type="button" class="entryBack">← Choose another task</button>
+    <div class="entryCard">
+      <div class="entryTitle"><i>5</i><div><h2>Tint Packaged Product</h2><p>Select the order and record supplied 5-gallon pails, 1-gallon pails, or quarts that were tinted, relabeled, and given new lids.</p></div></div>
+      <div class="entryTargetPrompt"><b>What is this tinting for?</b><span>Select the exact order packaging requirement or choose Future Stock.</span></div>
+      <div class="entrySegment" id="feedMode"><button type="button" class="selected" data-mode="order">Customer Order (S# or No S#)</button><button type="button" data-mode="stock">Future Stock</button></div>
+      <form id="reworkEntryForm" class="entryForm">
+        <label id="feedRequirementField" class="entryWide"><span>Tinting for</span><select id="entryFeedRequirement" required></select></label>
+        <div id="feedStockFields" class="entrySubgrid" hidden>
+          <label><span>Future-stock category</span><select id="entryFeedCategory" required></select></label>
+          <label><span>Future-stock color</span><select id="entryFeedColor" required></select></label>
+          <label><span>Feed package size</span><select id="entryFeedPackageType" required></select></label>
+          <label id="feedCaseField" hidden><span>Pieces in each case</span><input id="entryFeedCaseSize" type="number" min="1" step="1"></label>
+        </div>
+        <label><span>Supplied feed lot / batch</span><input id="entryFeedLot" required></label>
+        <label><span>Finished batch #</span><input id="entryReworkBatch" required></label>
+        <label><span>Number of packages</span><input id="entryReworkCount" type="number" min="1" step="1" required></label>
+        <label><span>Labor rate</span><select id="entryReworkRate" required></select></label>
+        <label><span>Labor hours</span><input id="entryReworkHours" type="number" min="0.01" step="0.01" required></label>
+        <label class="entryWide"><span>Notes</span><input id="entryReworkNotes" placeholder="Optional"></label>
+        <div id="entryReworkHelp" class="entryHelp entryWide"></div>
+        <button class="entrySave">Save Tinted & Relabeled Packages</button>
+      </form>
+    </div>
+  </section>
+</main>
+
+<div id="entryMessage" role="status" aria-live="polite"></div>
+<script>
+let dashboard={},catalog=[],contacts=[],costing={},session={},activePanel='',orderModeValue='s',productionModeValue='s',feedModeValue='order';
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmt=n=>Number(n||0).toLocaleString(undefined,{maximumFractionDigits:2});
+const unitName=u=>u==='qty'?'pieces':'gallons';
+const orderRef=s=>String(s||'').startsWith('N')?`No S# • ${s}`:s;
+function message(text,bad=false){entryMessage.textContent=text;entryMessage.className=bad?'show bad':'show';clearTimeout(message.timer);message.timer=setTimeout(()=>entryMessage.className='',4500)}
+function categories(selected=''){return catalog.map(x=>`<option value="${esc(x.category)}" ${x.category===selected?'selected':''}>${esc(x.category)} — ${x.unit==='qty'?'Qty':'Gallons'}</option>`).join('')||'<option value="">No categories available</option>'}
+function colors(category,selected=''){return (catalog.find(x=>x.category===category)?.colors||[]).map(x=>`<option value="${esc(x.name)}" ${x.name===selected?'selected':''}>${esc(x.name)}</option>`).join('')}
+function rates(selected=''){return (costing.current_rates||[]).map(x=>`<option value="${x.id}" ${String(x.id)===String(selected)?'selected':''}>${esc(x.labor_name)} — $${Number(x.hourly_rate).toFixed(2)}/hr</option>`).join('')||'<option value="">Manager must add a labor rate</option>'}
+function packageLabel(key){return dashboard.package_types?.find(x=>x.key===key)?.label||key}
+function showPanel(id){activePanel=id;taskMenu.hidden=true;document.querySelectorAll('.entryPanel').forEach(x=>x.hidden=x.id!==id);window.scrollTo({top:0,behavior:'smooth'})}
+function showMenu(){activePanel='';taskMenu.hidden=false;document.querySelectorAll('.entryPanel').forEach(x=>x.hidden=true);window.scrollTo({top:0,behavior:'smooth'})}
+document.querySelectorAll('.entryTask').forEach(x=>x.onclick=()=>showPanel(x.dataset.panel));document.querySelectorAll('.entryBack').forEach(x=>x.onclick=showMenu);
+function setMode(container,value){container.querySelectorAll('button').forEach(x=>x.classList.toggle('selected',x.dataset.mode===value))}
+function setDisabled(container,disabled){container.querySelectorAll('input,select').forEach(x=>x.disabled=disabled)}
+function updateOrderMode(value){orderModeValue=value;setMode(orderMode,value);const noS=value==='stock';sNumberField.hidden=noS;entrySNumber.disabled=noS;entrySNumber.required=!noS}
+orderMode.querySelectorAll('button').forEach(x=>x.onclick=()=>updateOrderMode(x.dataset.mode));
+function updateProductionMode(value){productionModeValue=value;setMode(productionMode,value);const stock=value==='stock';productionOrderField.hidden=stock;entryProductionOrder.disabled=stock;entryProductionOrder.required=!stock;productionStockFields.hidden=!stock;setDisabled(productionStockFields,!stock);updateProductionHelp()}
+productionMode.querySelectorAll('button').forEach(x=>x.onclick=()=>updateProductionMode(x.dataset.mode));
+function updateFeedMode(value){feedModeValue=value;setMode(feedMode,value);const stock=value==='stock';feedRequirementField.hidden=stock;entryFeedRequirement.disabled=stock;entryFeedRequirement.required=!stock;feedStockFields.hidden=!stock;setDisabled(feedStockFields,!stock);fillRework()}
+feedMode.querySelectorAll('button').forEach(x=>x.onclick=()=>updateFeedMode(x.dataset.mode));
+function fillCategory(categoryEl,colorEl,amountLabel){const old=colorEl.value,group=catalog.find(x=>x.category===categoryEl.value);colorEl.innerHTML=colors(categoryEl.value,old);amountLabel.textContent=group?.unit==='qty'?'Pieces needed':'Gallons needed'}
+function updateProductionHelp(){if(productionModeValue==='s'){const x=(dashboard.orders||[]).find(o=>o.id==entryProductionOrder.value),maximum=Number(x?.remaining||0);entryProductionAmount.max=maximum||'';if(maximum&&Number(entryProductionAmount.value)>maximum)entryProductionAmount.value=maximum;productionOrderHelp.textContent=x?`${fmt(maximum)} ${unitName(x.unit)} remain. This is the maximum you can manufacture; tinted amounts reduce this same balance.`:'';entryProductionAmountLabel.textContent=x?.unit==='qty'?'Pieces manufactured':'Gallons manufactured'}else{entryProductionAmount.removeAttribute('max');const group=catalog.find(x=>x.category===entryProductionCategory.value),open=(dashboard.stock_needs||[]).filter(x=>x.brand===entryProductionCategory.value&&x.color===entryProductionColor.value).reduce((n,x)=>n+Number(x.remaining||0),0);entryProductionAmountLabel.textContent=group?.unit==='qty'?'Pieces manufactured':'Gallons manufactured';productionStockHelp.textContent=open?`${fmt(open)} ${unitName(group?.unit)} of future stock are currently needed.`:'This will be saved as future stock.'}}
+function availablePackageTypes(unit,selected=''){return (dashboard.package_types||[]).filter(x=>x.unit===unit).map(x=>`<option value="${x.key}" ${x.key===selected?'selected':''}>${esc(x.label)}</option>`).join('')}
+function fillRequirementTypes(){const order=(dashboard.requirement_orders||[]).find(x=>x.id==entryRequirementOrder.value),old=entryRequirementType.value;entryRequirementType.innerHTML=availablePackageTypes(order?.unit||'gallons',old);const isCase=entryRequirementType.value==='case_pack';requirementCaseField.hidden=!isCase;entryRequirementCaseSize.required=isCase;entryRequirementCaseSize.disabled=!isCase;updateRequirementHelp()}
+function packageSize(type,sizeInput){const p=(dashboard.package_types||[]).find(x=>x.key===type);return type==='case_pack'?Number(sizeInput||0):Number(p?.size_gallons||0)}
+function updateRequirementHelp(){const order=(dashboard.requirement_orders||[]).find(x=>x.id==entryRequirementOrder.value);if(!order){entryRequirementHelp.textContent='No active order is available.';return}const already=(dashboard.packaging_requirements||[]).filter(x=>x.order_id==order.id).reduce((n,x)=>n+Number(x.required_gallons),0),planned=packageSize(entryRequirementType.value,entryRequirementCaseSize.value)*Number(entryRequirementCount.value||0);entryRequirementHelp.textContent=`Order amount: ${fmt(order.gallons)} ${unitName(order.unit)}. Already planned: ${fmt(already)}. This entry: ${fmt(planned)}.`}
+function fillPackageTypes(){const [sourceType,sourceId]=(entryPackageSource.value||':').split(':'),source=(dashboard.packageable||[]).find(x=>x.source_type===sourceType&&x.source_id==sourceId),old=entryPackageType.value;entryPackageType.innerHTML=availablePackageTypes(source?.unit||'gallons',old);const matching=(dashboard.packaging_requirements||[]).find(x=>sourceType==='order'&&x.order_id==sourceId&&x.package_type===entryPackageType.value),isCase=entryPackageType.value==='case_pack';if(isCase&&matching)entryPackageCaseSize.value=matching.package_size;packageCaseField.hidden=!isCase;entryPackageCaseSize.required=isCase;entryPackageCaseSize.disabled=!isCase;entryPackageAvailable.textContent=source?`${fmt(source.available)} ${unitName(source.unit)} available to package.`:'No produced product is waiting to be packaged.'}
+function openFeedRequirements(){return (dashboard.packaging_requirements||[]).map(requirement=>{const order=(dashboard.orders||[]).find(x=>x.id==requirement.order_id),needed=Number(requirement.required_count)-Number(requirement.completed_count),maxByAmount=order?Math.floor((Number(order.remaining)+.0001)/Number(requirement.package_size)):0;return{requirement,order,max:Math.min(needed,maxByAmount)}}).filter(x=>x.order&&x.max>0)}
+function fillFeedStockFields(){const oldColor=entryFeedColor.value,oldType=entryFeedPackageType.value,group=catalog.find(x=>x.category===entryFeedCategory.value);entryFeedColor.innerHTML=colors(entryFeedCategory.value,oldColor);entryFeedPackageType.innerHTML=availablePackageTypes(group?.unit||'gallons',oldType);const isCase=entryFeedPackageType.value==='case_pack';feedCaseField.hidden=!isCase;entryFeedCaseSize.required=isCase;entryFeedCaseSize.disabled=!isCase}
+function fillRework(){const oldRequirement=entryFeedRequirement.value,oldCategory=entryFeedCategory.value,oldRate=entryReworkRate.value;const requirements=openFeedRequirements();entryFeedRequirement.innerHTML='<option value="">Select the exact order and packaging requirement</option>'+requirements.map(x=>`<option value="${x.requirement.id}">${esc(orderRef(x.order.s_number))} — ${esc(x.order.brand)} / ${esc(x.order.color)} — ${esc(packageLabel(x.requirement.package_type))}${x.requirement.package_type==='case_pack'?` (${fmt(x.requirement.package_size)} per case)`:''} — ${x.max} package(s) available</option>`).join('');if(!requirements.length)entryFeedRequirement.innerHTML='<option value="">No incomplete order packaging requirements</option>';if([...entryFeedRequirement.options].some(x=>x.value===oldRequirement))entryFeedRequirement.value=oldRequirement;entryFeedCategory.innerHTML='<option value="">Select future-stock category</option>'+categories(oldCategory);fillFeedStockFields();entryReworkRate.innerHTML=rates(oldRate);if([...entryReworkRate.options].some(x=>x.value===oldRate))entryReworkRate.value=oldRate;let max=0,help='';if(feedModeValue==='order'){const target=requirements.find(x=>x.requirement.id==entryFeedRequirement.value);if(target){max=target.max;help=`${fmt(target.order.remaining)} ${unitName(target.order.unit)} remain on this order. Tinting these packages reduces that same balance; you may manufacture the rest.`}else help='Select the exact order and packaging requirement above.'}else{const group=catalog.find(x=>x.category===entryFeedCategory.value),size=packageSize(entryFeedPackageType.value,entryFeedCaseSize.value),open=(dashboard.stock_needs||[]).filter(x=>x.brand===entryFeedCategory.value&&x.color===entryFeedColor.value).reduce((n,x)=>n+Number(x.remaining||0),0);max=size>0?Math.floor((open+.0001)/size):0;help=open?`Future-stock need: ${fmt(open)} ${unitName(group?.unit)}. This package size allows up to ${max} package(s).`:'Select the future-stock category and color that this tinting is for.'}if(max){entryReworkCount.max=max;if(!entryReworkCount.value||Number(entryReworkCount.value)>max)entryReworkCount.value=max}else{entryReworkCount.removeAttribute('max')}entryReworkHelp.textContent=help;reworkEntryForm.querySelector('.entrySave').disabled=!max||!(costing.current_rates||[]).length}
+async function save(url,body,success,form){try{const response=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}),result=await response.json();if(!response.ok)throw Error(result.error||'The entry could not be saved.');form.reset();const remaining=result.remaining!==null&&result.remaining!==undefined?` Remaining order need: ${fmt(result.remaining)}.`:'';message(success+(result.need_fulfilled?` ${fmt(result.need_fulfilled)} was applied to the future-stock need.`:'')+remaining);await load();if(activePanel)showPanel(activePanel)}catch(error){message(error.message,true)}}
+async function load(){const responses=await Promise.all([fetch('/api/dashboard',{cache:'no-store'}),fetch('/api/catalog',{cache:'no-store'}),fetch('/api/contacts',{cache:'no-store'}),fetch('/api/costing',{cache:'no-store'}),fetch('/api/session',{cache:'no-store'})]);if(responses.some(x=>x.status===401)){location.href='/login';return}[dashboard,catalog,contacts,costing]=await Promise.all(responses.slice(0,4).map(x=>x.json()));session=(await responses[4].json()).user||{};dashboard.stock_needs=Array.isArray(dashboard.stock_needs)?dashboard.stock_needs:[];signedInAs.textContent=session.display_name||session.email||'';fullSystem.hidden=session.role==='team';
+  if(!entryShipMonth.value){const now=new Date();entryShipMonth.value=`${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`}
+  const oldOrderCategory=entryOrderCategory.value,oldProductionCategory=entryProductionCategory.value,oldProductionOrder=entryProductionOrder.value,oldRequirementOrder=entryRequirementOrder.value,oldPackageSource=entryPackageSource.value,oldProductionRate=entryProductionRate.value,oldPackageRate=entryPackageRate.value;
+  entryOrderCategory.innerHTML=categories(oldOrderCategory);entryProductionCategory.innerHTML='<option value="">Select future-stock category</option>'+categories(oldProductionCategory);fillCategory(entryOrderCategory,entryOrderColor,entryOrderAmountLabel);entryProductionColor.innerHTML=colors(entryProductionCategory.value,entryProductionColor.value);
+  entryRecipients.innerHTML=contacts.length?contacts.map(x=>`<label><input type="checkbox" value="${x.id}"><span>${esc(x.name)}</span><small>${esc(x.email)}</small></label>`).join(''):'<span class="entryEmpty">No email recipients configured.</span>';
+  entryProductionOrder.innerHTML='<option value="">Select the exact S# or no-S# order</option>'+(dashboard.orders||[]).map(x=>`<option value="${x.id}">${esc(orderRef(x.s_number))} — ${esc(x.brand)} / ${esc(x.color)} — ${fmt(x.remaining)} ${unitName(x.unit)} left</option>`).join('');if(!(dashboard.orders||[]).length)entryProductionOrder.innerHTML='<option value="">No open order lines</option>';if([...entryProductionOrder.options].some(x=>x.value===oldProductionOrder))entryProductionOrder.value=oldProductionOrder;
+  entryProductionRate.innerHTML=rates(oldProductionRate);entryPackageRate.innerHTML=rates(oldPackageRate);
+  entryRequirementOrder.innerHTML=(dashboard.requirement_orders||[]).map(x=>`<option value="${x.id}">${esc(orderRef(x.s_number))} — ${esc(x.brand)} / ${esc(x.color)} — ${fmt(x.gallons)} ${unitName(x.unit)}</option>`).join('')||'<option value="">No active order lines</option>';if([...entryRequirementOrder.options].some(x=>x.value===oldRequirementOrder))entryRequirementOrder.value=oldRequirementOrder;
+  entryPackageSource.innerHTML=(dashboard.packageable||[]).map(x=>`<option value="${x.source_type}:${x.source_id}">${x.source_type==='stock'?'FUTURE STOCK':esc(orderRef(x.s_number))} — ${esc(x.brand)} / ${esc(x.color)} — ${fmt(x.available)} ${unitName(x.unit)}</option>`).join('')||'<option value="">Nothing is ready to package</option>';if([...entryPackageSource.options].some(x=>x.value===oldPackageSource))entryPackageSource.value=oldPackageSource;
+  productionEntryForm.querySelector('.entrySave').disabled=productionModeValue==='s'&&!(dashboard.orders||[]).length||!(costing.current_rates||[]).length;requirementEntryForm.querySelector('.entrySave').disabled=!(dashboard.requirement_orders||[]).length;packageEntryForm.querySelector('.entrySave').disabled=!(dashboard.packageable||[]).length||!(costing.current_rates||[]).length;
+  fillRequirementTypes();fillPackageTypes();updateOrderMode(orderModeValue);updateProductionMode(productionModeValue);updateFeedMode(feedModeValue)
+}
+entryOrderCategory.onchange=()=>fillCategory(entryOrderCategory,entryOrderColor,entryOrderAmountLabel);
+entryProductionCategory.onchange=()=>{entryProductionColor.innerHTML=colors(entryProductionCategory.value);updateProductionHelp()};entryProductionColor.onchange=updateProductionHelp;entryProductionOrder.onchange=updateProductionHelp;
+entryRequirementOrder.onchange=fillRequirementTypes;entryRequirementType.onchange=fillRequirementTypes;entryRequirementCaseSize.oninput=updateRequirementHelp;entryRequirementCount.oninput=updateRequirementHelp;
+entryPackageSource.onchange=fillPackageTypes;entryPackageType.onchange=fillPackageTypes;
+entryFeedRequirement.onchange=fillRework;entryFeedCategory.onchange=()=>{fillFeedStockFields();fillRework()};entryFeedColor.onchange=fillRework;entryFeedPackageType.onchange=()=>{fillFeedStockFields();fillRework()};entryFeedCaseSize.oninput=fillRework;
+orderEntryForm.onsubmit=e=>{e.preventDefault();save('/api/orders',{brand:entryOrderCategory.value,color:entryOrderColor.value,s_number:orderModeValue==='s'?entrySNumber.value:'',gallons:Number(entryOrderAmount.value),ship_month:entryShipMonth.value,recipient_ids:[...entryRecipients.querySelectorAll('input:checked')].map(x=>Number(x.value))},orderModeValue==='s'?'Order saved. Next choose Manufacture Product or Tint Packaged Product.':'Order saved without an S#. Next choose Manufacture Product or Tint Packaged Product.',e.target)};
+productionEntryForm.onsubmit=e=>{e.preventDefault();const common={batch_number:entryBatch.value,gallons:Number(entryProductionAmount.value),rate_id:Number(entryProductionRate.value),labor_hours:Number(entryProductionHours.value)};if(productionModeValue==='s')save('/api/production',{...common,order_id:Number(entryProductionOrder.value)},'Manufactured amount saved.',e.target);else save('/api/stock-production',{...common,brand:entryProductionCategory.value,color:entryProductionColor.value},'Future-stock production saved.',e.target)};
+requirementEntryForm.onsubmit=e=>{e.preventDefault();save('/api/packaging-requirements',{order_id:Number(entryRequirementOrder.value),package_type:entryRequirementType.value,package_size:Number(entryRequirementCaseSize.value||0),required_count:Number(entryRequirementCount.value)},'Packaging requirement saved.',e.target)};
+packageEntryForm.onsubmit=e=>{e.preventDefault();const [source_type,source_id]=entryPackageSource.value.split(':');save('/api/packaging',{source_type,source_id:Number(source_id),package_type:entryPackageType.value,package_size:Number(entryPackageCaseSize.value||0),package_count:Number(entryPackageCount.value),rate_id:Number(entryPackageRate.value),labor_hours:Number(entryPackageHours.value)},'Completed packaging saved.',e.target)};
+reworkEntryForm.onsubmit=e=>{e.preventDefault();save('/api/feed-rework',{target_type:feedModeValue,requirement_id:Number(entryFeedRequirement.value||0),brand:entryFeedCategory.value,color:entryFeedColor.value,package_type:entryFeedPackageType.value,package_size:Number(entryFeedCaseSize.value||0),feed_lot:entryFeedLot.value,batch_number:entryReworkBatch.value,package_count:Number(entryReworkCount.value),rate_id:Number(entryReworkRate.value),labor_hours:Number(entryReworkHours.value),labor_notes:entryReworkNotes.value},'Tinted packaged feed saved.',e.target)};
+load().catch(error=>message(error.message,true));
+</script>
+</body>
+</html>
