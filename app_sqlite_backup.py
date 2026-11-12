@@ -72,7 +72,13 @@ EMAIL_ENABLED = os.environ.get("EMAIL_ENABLED", "true").strip().lower() in {"1",
 EMAIL_PROVIDER = os.environ.get("EMAIL_PROVIDER", "gmail_smtp").strip().lower()
 GOOGLE_APPS_SCRIPT_URL = os.environ.get("GOOGLE_APPS_SCRIPT_URL", "").strip()
 GOOGLE_APPS_SCRIPT_SECRET = os.environ.get("GOOGLE_APPS_SCRIPT_SECRET", "").strip()
-SESSIONS = {}
+SESSION_SECRET = os.environ.get("SESSION_SECRET", "").strip() or hashlib.sha256(
+    (APP_PASSWORD + "|ollies-production-session").encode("utf-8")
+).hexdigest()
+SESSION_TTL_SECONDS = 12 * 60 * 60
+SESSION_USER_CACHE_SECONDS = 60
+SESSION_USER_CACHE = {}
+REVOKED_SESSIONS = {}
 SESSION_LOCK = threading.RLock()
 DASHBOARD_CACHE_LOCK = threading.RLock()
 DASHBOARD_CACHE = {"expires": 0.0, "value": None}
@@ -123,33 +129,87 @@ def verify_password(password, stored):
 
 
 def create_session(user):
-    token = secrets.token_urlsafe(32)
     now = time.time()
+    payload = {
+        "exp": int(now + SESSION_TTL_SECONDS),
+        "id": user["id"],
+        "username": user["username"],
+        "email": user["email"] if "email" in user.keys() else "",
+        "display_name": user["display_name"],
+        "role": user["role"],
+        "nonce": secrets.token_urlsafe(12),
+    }
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    signature = base64.urlsafe_b64encode(
+        hmac.new(SESSION_SECRET.encode("utf-8"), encoded.encode("ascii"), hashlib.sha256).digest()
+    ).decode("ascii").rstrip("=")
     with SESSION_LOCK:
-        expired = [key for key, value in SESSIONS.items() if value["expires"] <= now]
+        expired = [key for key, value in REVOKED_SESSIONS.items() if value <= now]
         for key in expired:
-            SESSIONS.pop(key, None)
-        SESSIONS[token] = {"expires": now + 12 * 60 * 60, "id": user["id"],
-                           "username": user["username"], "email": user["email"] if "email" in user.keys() else "",
-                           "display_name": user["display_name"], "role": user["role"]}
-    return token
+            REVOKED_SESSIONS.pop(key, None)
+        SESSION_USER_CACHE[user["id"]] = (now + SESSION_USER_CACHE_SECONDS, dict(payload))
+    return encoded + "." + signature
+
+
+def decode_session(token):
+    try:
+        encoded, signature = token.split(".", 1)
+        expected = base64.urlsafe_b64encode(
+            hmac.new(SESSION_SECRET.encode("utf-8"), encoded.encode("ascii"), hashlib.sha256).digest()
+        ).decode("ascii").rstrip("=")
+        if not hmac.compare_digest(signature, expected):
+            return None
+        padding = "=" * (-len(encoded) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(encoded + padding).decode("utf-8"))
+        if int(payload.get("exp", 0)) <= time.time() or not int(payload.get("id", 0)):
+            return None
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        with SESSION_LOCK:
+            if REVOKED_SESSIONS.get(token_hash, 0) > time.time():
+                return None
+        return payload
+    except (ValueError, TypeError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
 
 
 def valid_session(token):
-    with SESSION_LOCK:
-        session = SESSIONS.get(token)
-        if session and session["expires"] > time.time(): return True
-        SESSIONS.pop(token, None); return False
+    return session_data(token) is not None
 
 
 def session_data(token):
+    payload = decode_session(token)
+    if not payload:
+        return None
+    user_id = int(payload["id"])
+    now = time.time()
     with SESSION_LOCK:
-        return SESSIONS.get(token) if valid_session(token) else None
+        cached = SESSION_USER_CACHE.get(user_id)
+        if cached and cached[0] > now:
+            return dict(cached[1])
+    with closing(connect()) as con:
+        user = con.execute("SELECT id,username,email,display_name,role FROM users WHERE id=? AND active=1", (user_id,)).fetchone()
+    if not user:
+        return None
+    result = dict(user)
+    result["exp"] = payload["exp"]
+    with SESSION_LOCK:
+        SESSION_USER_CACHE[user_id] = (now + SESSION_USER_CACHE_SECONDS, result)
+    return dict(result)
 
 
 def clear_session(token):
+    payload = decode_session(token)
     with SESSION_LOCK:
-        SESSIONS.pop(token, None)
+        if payload:
+            REVOKED_SESSIONS[hashlib.sha256(token.encode("utf-8")).hexdigest()] = int(payload["exp"])
+            SESSION_USER_CACHE.pop(int(payload["id"]), None)
+
+
+def invalidate_session_user(user_id):
+    with SESSION_LOCK:
+        SESSION_USER_CACHE.pop(int(user_id), None)
 
 
 def invalidate_dashboard_cache():
@@ -1516,6 +1576,16 @@ class Handler(BaseHTTPRequestHandler):
     def send_redirect(self, location):
         self.send_response(302); self.send_header("Location", location); self.end_headers()
 
+    def session_cookie(self, token="", max_age=0):
+        secure = "; Secure" if (
+            os.environ.get("RENDER", "").strip().lower() == "true"
+            or self.headers.get("X-Forwarded-Proto", "").strip().lower() == "https"
+        ) else ""
+        return (
+            f"ollies_session={token}; Path=/; HttpOnly; SameSite=Lax; "
+            f"Max-Age={int(max_age)}{secure}"
+        )
+
     def full_ui_authorized(self):
         if not self.authorized(): return False
         if self.current_user().get("role") == "team":
@@ -1569,7 +1639,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/logout":
             clear_session(self.session_token())
             self.send_response(302); self.send_header("Location", "/login")
-            self.send_header("Set-Cookie", "ollies_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+            self.send_header("Set-Cookie", self.session_cookie())
             self.end_headers(); return
         if path == "/api/session":
             user = self.current_user()
@@ -1642,12 +1712,12 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json({"error": "Incorrect username or password."}, 401)
                 token = create_session(user); data = json.dumps({"ok": True, "role": user["role"]}).encode()
                 self.send_response(200); self.send_header("Content-Type", "application/json")
-                self.send_header("Set-Cookie", f"ollies_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=43200")
+                self.send_header("Set-Cookie", self.session_cookie(token, SESSION_TTL_SECONDS))
                 self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data); return
             if path == "/api/logout":
                 clear_session(self.session_token()); data = json.dumps({"ok": True}).encode()
                 self.send_response(200); self.send_header("Content-Type", "application/json")
-                self.send_header("Set-Cookie", "ollies_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+                self.send_header("Set-Cookie", self.session_cookie())
                 self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data); return
             if path == "/api/users":
                 if not self.require_role("admin"): return
@@ -2160,6 +2230,22 @@ class Handler(BaseHTTPRequestHandler):
                     if not cur.rowcount: raise ValueError("Labor entry was not found.")
                     con.commit()
                 return self.send_json({"ok":True,"labor_cost":cost})
+            if kind == "contacts":
+                name = str(payload.get("name", "")).strip()
+                email = str(payload.get("email", "")).strip().lower()
+                active_value = payload.get("active", True)
+                active = 1 if active_value in (True, 1, "1", "true", "on") else 0
+                if not name or not valid_email(email):
+                    raise ValueError("Enter a recipient name and valid email address.")
+                with closing(connect()) as con:
+                    cur = con.execute(
+                        "UPDATE contacts SET name=?,email=?,active=? WHERE id=?",
+                        (name, email, active, record_id),
+                    )
+                    if not cur.rowcount:
+                        raise ValueError("Email recipient was not found.")
+                    con.commit()
+                return self.send_json({"ok": True})
             if kind == "users":
                 if not self.require_role("admin"): return
                 display_name = str(payload.get("display_name", "")).strip(); email = str(payload.get("email", "")).strip().lower()
@@ -2179,8 +2265,7 @@ class Handler(BaseHTTPRequestHandler):
                         cur = con.execute("UPDATE users SET username=?,email=?,display_name=?,role=?,active=? WHERE id=?", (email,email,display_name,role,active,record_id))
                     if not cur.rowcount: raise ValueError("User was not found.")
                     con.commit()
-                if record_id == self.current_user()["id"]:
-                    self.current_user().update({"username": email, "email": email, "display_name": display_name})
+                invalidate_session_user(record_id)
                 return self.send_json({"ok": True})
             if kind == "packaging":
                 package_type = str(payload.get("package_type", "")).strip(); raw_count = float(payload.get("package_count", 0))
@@ -2319,7 +2404,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"ok": True})
             return self.send_error(404)
         except DatabaseIntegrityError:
-            self.send_json({"error": "That login email already exists." if kind == "users" else "That batch number already exists."}, 400)
+            message = (
+                "That login email already exists." if kind == "users"
+                else "That recipient email already exists." if kind == "contacts"
+                else "That batch number already exists."
+            )
+            self.send_json({"error": message}, 400)
         except (ValueError, TypeError, json.JSONDecodeError) as e:
             self.send_json({"error": str(e)}, 400)
 
@@ -2385,12 +2475,14 @@ class Handler(BaseHTTPRequestHandler):
                     if used: raise ValueError("This category/color is used by an order and cannot be deleted.")
                     con.execute("DELETE FROM catalog WHERE id=?", (record_id,))
                 elif kind == "contacts":
-                    cur = con.execute("UPDATE contacts SET active=0 WHERE id=?", (record_id,))
+                    con.execute("DELETE FROM order_recipients WHERE contact_id=?", (record_id,))
+                    cur = con.execute("DELETE FROM contacts WHERE id=?", (record_id,))
                     if not cur.rowcount: raise ValueError("Email contact was not found.")
                 elif kind == "users":
                     if record_id == self.current_user()["id"]: raise ValueError("You cannot delete your own account.")
                     cur = con.execute("DELETE FROM users WHERE id=?", (record_id,))
                     if not cur.rowcount: raise ValueError("User was not found.")
+                    invalidate_session_user(record_id)
                 else: return self.send_error(404)
                 con.commit()
             return self.send_json({"ok": True})

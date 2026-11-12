@@ -21,6 +21,7 @@ render = (ROOT / "render.yaml").read_text(encoding="utf-8")
 gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
 entrypoint = (ROOT / "app.py").read_text(encoding="utf-8")
 migration = (ROOT / "migrate_sqlite_to_supabase.py").read_text(encoding="utf-8")
+admin_page = (ROOT / "admin.html").read_text(encoding="utf-8")
 assert "psycopg" in requirements
 assert "SUPABASE_DATABASE_URL" in render
 assert "EMAIL_ENABLED" in render and 'value: "false"' in render
@@ -28,6 +29,8 @@ assert "EMAIL_PROVIDER" in render and "GOOGLE_APPS_SCRIPT_URL" in render and "GO
 assert "DB_POOL_MAX" in render and "MAX_REQUEST_THREADS" in render and "DASHBOARD_CACHE_TTL" in render
 assert "idx_production_order" in backend.SUPABASE_SCHEMA and "idx_packaging_order_type" in backend.SUPABASE_SCHEMA
 assert hasattr(backend, "PostgresPool") and hasattr(backend, "BoundedThreadingHTTPServer")
+assert hasattr(backend, "decode_session") and "hmac.new(SESSION_SECRET" in Path(backend.__file__).read_text(encoding="utf-8")
+assert "saveContact" in admin_page and "contactActive" in admin_page and "Email recipient updated" in admin_page
 assert "*.db" in gitignore and ".env" in gitignore and ".venv/" in gitignore
 assert "backend.main()" in entrypoint
 assert "SUPABASE_DATABASE_URL" in migration

@@ -60,6 +60,14 @@ try:
     ok("POST", "/api/users", {"display_name": "Team", "email": "team@test.local", "password": "TeamUser123!", "role": "team"}, admin, 201)
     manager = login("manager@test.local", "Manager123!")
     team = login("team@test.local", "TeamUser123!")
+    # Signed cookies must survive loss of all process-local session cache, as
+    # happens when Render sleeps, restarts, or deploys a new instance.
+    with app.SESSION_LOCK:
+        app.SESSION_USER_CACHE.clear()
+        app.REVOKED_SESSIONS.clear()
+    session, _ = ok("GET", "/api/session", token=admin)
+    assert session["user"]["email"] == app.APP_ADMIN_EMAIL
+    assert call("GET", "/api/session", token=admin + "tampered")[0] == 401
     entry_page = call("GET", "/entry", token=team)
     assert entry_page[0] == 200
     assert b"What is this manufacturing for?" in entry_page[1]
@@ -69,6 +77,24 @@ try:
         team_page = call("GET", route, token=team)
         assert team_page[0] == 302 and team_page[2].get("Location") == "/entry", route
     assert call("GET", "/", token=manager)[0] == 200
+
+    ok("POST", "/api/contacts", {"name": "Shipping Lead", "email": "shipping@test.local"}, team, 201)
+    admin_data, _ = ok("GET", "/api/admin", token=admin)
+    contact_id = next(x["id"] for x in admin_data["contacts"] if x["email"] == "shipping@test.local")
+    ok("PUT", f"/api/admin/contacts/{contact_id}", {
+        "name": "Shipping Manager", "email": "shipping-manager@test.local", "active": False
+    }, manager)
+    contacts, _ = ok("GET", "/api/contacts", token=admin)
+    assert not any(x["id"] == contact_id for x in contacts)
+    ok("PUT", f"/api/admin/contacts/{contact_id}", {
+        "name": "Shipping Manager", "email": "shipping-manager@test.local", "active": True
+    }, manager)
+    contacts, _ = ok("GET", "/api/contacts", token=admin)
+    assert any(x["id"] == contact_id for x in contacts)
+    assert call("DELETE", f"/api/admin/contacts/{contact_id}", token=manager)[0] == 403
+    ok("DELETE", f"/api/admin/contacts/{contact_id}", token=admin)
+    admin_data, _ = ok("GET", "/api/admin", token=admin)
+    assert not any(x["id"] == contact_id for x in admin_data["contacts"])
 
     ok("POST", "/api/catalog", {"category": "Paint", "color": "Blue", "unit": "gallons"}, team, 201)
     ok("POST", "/api/catalog", {"category": "Paint", "color": "Red", "unit": "gallons"}, team, 201)
@@ -302,10 +328,11 @@ try:
     admin_data, _ = ok("GET", "/api/admin", token=admin)
     team_id = next(x["id"] for x in admin_data["users"] if x["email"] == "team@test.local")
     ok("DELETE", f"/api/admin/users/{team_id}", token=admin)
+    assert call("GET", "/api/session", token=team)[0] == 401
     assert call("POST", "/api/login", {"email": "team@test.local", "password": "TeamUser123!"})[0] == 401
     logout_status, _, logout_headers = call("GET", "/logout", token=admin)
     assert logout_status == 302 and "Max-Age=0" in logout_headers.get("Set-Cookie", "")
-    print("PASS: login, role-specific team entry, S# and no-S# customer orders, mixed manufacture-and-tint fulfillment, shared remaining need, catalog, future-stock needs, labor, packaging, stock rework, case packs, assignment, shipping, edit, undo, reports, pages, CSV, and user deletion")
+    print("PASS: restart-safe login, recipient edit/enable/disable/delete, role-specific team entry, S# and no-S# customer orders, mixed manufacture-and-tint fulfillment, shared remaining need, catalog, future-stock needs, labor, packaging, stock rework, case packs, assignment, shipping, edit, undo, reports, pages, CSV, and user deletion")
 finally:
     server.shutdown()
     server.server_close()
