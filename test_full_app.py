@@ -289,6 +289,22 @@ try:
     assert next(x for x in dashboard["stock_inventory"] if x["batch_number"] == "FEED-STOCK-RED-1")["package_count"] == 1
     disposable_need, _ = ok("POST", "/api/stock-needs", {"brand": "Parts", "color": "Red", "amount": 7, "note": "Temporary"}, team, 201)
     ok("DELETE", f"/api/admin/stock-needs/{disposable_need['id']}", token=admin)
+    ok("POST", "/api/stock-production", {
+        "brand": "Paint", "color": "Blue", "batch_number": "DELETE-STOCK-1",
+        "gallons": 1, "rate_id": rate_id, "labor_hours": 0.1
+    }, team, 201)
+    dashboard, _ = ok("GET", "/api/dashboard")
+    disposable_source = next(x for x in dashboard["packageable"] if x["batch_number"] == "DELETE-STOCK-1")
+    ok("POST", "/api/packaging", {
+        "source_type": "stock", "source_id": disposable_source["source_id"],
+        "package_type": "1_gallon_pail", "package_count": 1,
+        "rate_id": rate_id, "labor_hours": 0.1
+    }, team, 201)
+    ok("DELETE", f"/api/admin/batches/{disposable_source['source_id']}", token=admin)
+    dashboard, _ = ok("GET", "/api/dashboard")
+    assert not any(x["batch_number"] == "DELETE-STOCK-1" for x in dashboard["stock_inventory"])
+    assert not any(x["batch_number"] == "DELETE-STOCK-1" for x in dashboard["packageable"])
+    assert next(x for x in dashboard["stock_needs"] if x["id"] == need_id)["remaining"] == 2
     ok("POST", "/api/labor-entries", {"order_id": qty_order["id"], "process_name": "Quality Control", "rate_id": rate_id, "hours": 0.25, "worked_at": "2026-11-05T10:00:00", "notes": "Inspection"}, team, 201)
     costing, _ = ok("GET", "/api/costing", token=admin)
     assert all(isinstance(costing[key], list) for key in ("rates", "entries", "summary", "stock_summary", "s_summary"))

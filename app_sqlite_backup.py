@@ -2416,6 +2416,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         try:
             return self._do_DELETE()
+        except DatabaseIntegrityError:
+            return self.send_json({"error": "This record is connected to other data. Delete the related records first."}, 400)
         except DatabaseOperationalError:
             return self.send_json({"error": "The database is busy. Please try again in a moment."}, 503)
 
@@ -2428,10 +2430,27 @@ class Handler(BaseHTTPRequestHandler):
             with closing(connect()) as con:
                 if kind == "batches":
                     lock_production_sql(con, record_id)
-                    if con.execute("SELECT 1 FROM labor_entries WHERE production_id=?", (record_id,)).fetchone():
-                        raise ValueError("Delete this batch's labor entries in Labor Costing before deleting the batch.")
+                    item = con.execute("""SELECT p.id,p.order_id,p.gallons,o.s_number
+                      FROM production p LEFT JOIN orders o ON o.id=p.order_id WHERE p.id=?""", (record_id,)).fetchone()
+                    if not item: raise ValueError("Batch was not found.")
+                    if item["order_id"] is None:
+                        con.execute("DELETE FROM stock_packaging WHERE production_id=?", (record_id,))
+                    else:
+                        remaining_produced = float(con.execute(
+                            "SELECT COALESCE(SUM(gallons),0) FROM production WHERE order_id=? AND id<>?",
+                            (item["order_id"], record_id),
+                        ).fetchone()[0])
+                        packaged = float(con.execute(
+                            "SELECT COALESCE(SUM(gallons),0) FROM packaging WHERE order_id=?",
+                            (item["order_id"],),
+                        ).fetchone()[0])
+                        if packaged > remaining_produced + .0001:
+                            raise ValueError("Delete or reduce this order's packaging before deleting this batch.")
+                    con.execute("DELETE FROM labor_entries WHERE production_id=?", (record_id,))
                     cur = con.execute("DELETE FROM production WHERE id=?", (record_id,))
                     if not cur.rowcount: raise ValueError("Batch was not found.")
+                    if item["order_id"] is not None:
+                        refresh_s_number_ready(con,item["s_number"],self.current_user().get("display_name","System"))
                 elif kind == "packaging":
                     lock_packaging_sql(con, record_id)
                     item = con.execute("""SELECT k.s_number,s.shipped_at FROM packaging k LEFT JOIN s_number_status s
