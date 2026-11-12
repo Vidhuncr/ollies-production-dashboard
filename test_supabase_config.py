@@ -25,6 +25,9 @@ assert "psycopg" in requirements
 assert "SUPABASE_DATABASE_URL" in render
 assert "EMAIL_ENABLED" in render and 'value: "false"' in render
 assert "EMAIL_PROVIDER" in render and "GOOGLE_APPS_SCRIPT_URL" in render and "GOOGLE_APPS_SCRIPT_SECRET" in render
+assert "DB_POOL_MAX" in render and "MAX_REQUEST_THREADS" in render and "DASHBOARD_CACHE_TTL" in render
+assert "idx_production_order" in backend.SUPABASE_SCHEMA and "idx_packaging_order_type" in backend.SUPABASE_SCHEMA
+assert hasattr(backend, "PostgresPool") and hasattr(backend, "BoundedThreadingHTTPServer")
 assert "*.db" in gitignore and ".env" in gitignore and ".venv/" in gitignore
 assert "backend.main()" in entrypoint
 assert "SUPABASE_DATABASE_URL" in migration

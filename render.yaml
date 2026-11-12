@@ -19,6 +19,12 @@ services:
         sync: false
       - key: PLANT_TIMEZONE
         value: America/Chicago
+      - key: DB_POOL_MAX
+        value: "8"
+      - key: MAX_REQUEST_THREADS
+        value: "32"
+      - key: DASHBOARD_CACHE_TTL
+        value: "1.5"
       - key: EMAIL_ENABLED
         value: "false"
       - key: EMAIL_PROVIDER

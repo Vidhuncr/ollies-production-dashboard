@@ -75,6 +75,23 @@ EMAIL_SETUP_APPS_SCRIPT.md. Local Gmail SMTP notifications still work with
 EMAIL_PROVIDER=gmail_smtp.
 
 
+PERFORMANCE AND CONCURRENT USERS
+
+The application uses a bounded PostgreSQL connection pool, a bounded request
+thread count, write-time row locks for quantity-changing operations, indexed
+dashboard queries, and a 1.5-second shared dashboard cache. Successful writes
+immediately invalidate the cache. The main dashboard returns only the 250 most
+recent shipment rows; complete history remains available in reports.
+
+Recommended starting values for one Render service instance:
+
+  DB_POOL_MAX=8
+  MAX_REQUEST_THREADS=32
+  DASHBOARD_CACHE_TTL=1.5
+
+Increase these only after checking Render memory and Supabase connection usage.
+
+
 LOGIN ROLES
 
 Admin:

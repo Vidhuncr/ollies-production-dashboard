@@ -14,20 +14,25 @@ import threading
 import time
 import webbrowser
 from contextlib import closing
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from email.message import EmailMessage
+from queue import Empty, Full, LifoQueue
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 try:
     import psycopg
+    from psycopg import Error as PsycopgError
     from psycopg.errors import IntegrityError as PsycopgIntegrityError
 except ImportError:
     psycopg = None
+
+    class PsycopgError(Exception):
+        pass
 
     class PsycopgIntegrityError(Exception):
         pass
@@ -46,6 +51,15 @@ def load_local_env():
                 os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
+def bounded_env_number(name, default, minimum, maximum, as_float=False):
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = float(default)
+    value = max(float(minimum), min(value, float(maximum)))
+    return value if as_float else int(value)
+
+
 load_local_env()
 SUPABASE_DATABASE_URL = (os.environ.get("SUPABASE_DATABASE_URL") or os.environ.get("DATABASE_URL") or "").strip()
 USE_SUPABASE = bool(SUPABASE_DATABASE_URL)
@@ -59,7 +73,13 @@ EMAIL_PROVIDER = os.environ.get("EMAIL_PROVIDER", "gmail_smtp").strip().lower()
 GOOGLE_APPS_SCRIPT_URL = os.environ.get("GOOGLE_APPS_SCRIPT_URL", "").strip()
 GOOGLE_APPS_SCRIPT_SECRET = os.environ.get("GOOGLE_APPS_SCRIPT_SECRET", "").strip()
 SESSIONS = {}
+SESSION_LOCK = threading.RLock()
+DASHBOARD_CACHE_LOCK = threading.RLock()
+DASHBOARD_CACHE = {"expires": 0.0, "value": None}
+DASHBOARD_CACHE_TTL = bounded_env_number("DASHBOARD_CACHE_TTL", 1.5, 0.25, 10, as_float=True)
+MAX_REQUEST_BYTES = bounded_env_number("MAX_REQUEST_BYTES", 1048576, 4096, 5 * 1024 * 1024)
 DatabaseIntegrityError = (sqlite3.IntegrityError, PsycopgIntegrityError)
+DatabaseOperationalError = (sqlite3.OperationalError, PsycopgError, RuntimeError)
 PACKAGE_TYPES = {
     "5_gallon_pail": ("5 Gallon Pail", 5.0),
     "1_gallon_pail": ("1 Gallon Pail", 1.0),
@@ -104,20 +124,38 @@ def verify_password(password, stored):
 
 def create_session(user):
     token = secrets.token_urlsafe(32)
-    SESSIONS[token] = {"expires": time.time() + 12 * 60 * 60, "id": user["id"],
-                       "username": user["username"], "email": user["email"] if "email" in user.keys() else "",
-                       "display_name": user["display_name"], "role": user["role"]}
+    now = time.time()
+    with SESSION_LOCK:
+        expired = [key for key, value in SESSIONS.items() if value["expires"] <= now]
+        for key in expired:
+            SESSIONS.pop(key, None)
+        SESSIONS[token] = {"expires": now + 12 * 60 * 60, "id": user["id"],
+                           "username": user["username"], "email": user["email"] if "email" in user.keys() else "",
+                           "display_name": user["display_name"], "role": user["role"]}
     return token
 
 
 def valid_session(token):
-    session = SESSIONS.get(token)
-    if session and session["expires"] > time.time(): return True
-    SESSIONS.pop(token, None); return False
+    with SESSION_LOCK:
+        session = SESSIONS.get(token)
+        if session and session["expires"] > time.time(): return True
+        SESSIONS.pop(token, None); return False
 
 
 def session_data(token):
-    return SESSIONS.get(token) if valid_session(token) else None
+    with SESSION_LOCK:
+        return SESSIONS.get(token) if valid_session(token) else None
+
+
+def clear_session(token):
+    with SESSION_LOCK:
+        SESSIONS.pop(token, None)
+
+
+def invalidate_dashboard_cache():
+    with DASHBOARD_CACHE_LOCK:
+        DASHBOARD_CACHE["expires"] = 0.0
+        DASHBOARD_CACHE["value"] = None
 
 
 def valid_email(value):
@@ -237,10 +275,11 @@ class PostgresCursor:
 
 
 class PostgresConnection:
-    def __init__(self, database_url):
+    def __init__(self, database_url=None, connection=None, pool=None):
         if psycopg is None:
             raise RuntimeError("PostgreSQL support is not installed. Run: python -m pip install -r requirements.txt")
-        self._connection = psycopg.connect(database_url, connect_timeout=10, prepare_threshold=None)
+        self._pool = pool
+        self._connection = connection or psycopg.connect(database_url, connect_timeout=10, prepare_threshold=None)
 
     def execute(self, sql, params=()):
         statement = postgres_sql(sql).strip()
@@ -263,16 +302,151 @@ class PostgresConnection:
         self._connection.rollback()
 
     def close(self):
-        self._connection.close()
+        connection, self._connection = self._connection, None
+        if connection is None:
+            return
+        if self._pool is not None:
+            self._pool.put(connection)
+        else:
+            connection.close()
+
+
+class PostgresPool:
+    """Small bounded pool that works with the app's existing connection wrapper."""
+
+    def __init__(self, database_url, max_size=8, timeout=10, max_idle=300):
+        self.database_url = database_url
+        self.max_size = max(1, min(int(max_size), 20))
+        self.timeout = max(1, int(timeout))
+        self.max_idle = max(30, int(max_idle))
+        self.available = LifoQueue(maxsize=self.max_size)
+        self.lock = threading.Lock()
+        self.total = 0
+
+    def _decrement(self):
+        with self.lock:
+            self.total = max(0, self.total - 1)
+
+    def _create(self):
+        try:
+            return psycopg.connect(self.database_url, connect_timeout=10, prepare_threshold=None)
+        except Exception:
+            self._decrement()
+            raise
+
+    def get(self):
+        while True:
+            try:
+                connection, returned_at = self.available.get_nowait()
+                if connection.closed or time.monotonic() - returned_at > self.max_idle:
+                    try:
+                        connection.close()
+                    finally:
+                        self._decrement()
+                    continue
+                return connection
+            except Empty:
+                with self.lock:
+                    create_new = self.total < self.max_size
+                    if create_new:
+                        self.total += 1
+                if create_new:
+                    return self._create()
+                try:
+                    connection, returned_at = self.available.get(timeout=self.timeout)
+                except Empty as exc:
+                    raise RuntimeError("The database is busy. Please try again in a moment.") from exc
+                if connection.closed or time.monotonic() - returned_at > self.max_idle:
+                    try:
+                        connection.close()
+                    finally:
+                        self._decrement()
+                    continue
+                return connection
+
+    def put(self, connection):
+        try:
+            connection.rollback()
+        except Exception:
+            try:
+                connection.close()
+            finally:
+                self._decrement()
+            return
+        try:
+            self.available.put_nowait((connection, time.monotonic()))
+        except Full:
+            try:
+                connection.close()
+            finally:
+                self._decrement()
+
+
+POSTGRES_POOL = None
+POSTGRES_POOL_LOCK = threading.Lock()
+
+
+def get_postgres_pool():
+    global POSTGRES_POOL
+    if POSTGRES_POOL is None:
+        with POSTGRES_POOL_LOCK:
+            if POSTGRES_POOL is None:
+                POSTGRES_POOL = PostgresPool(
+                    SUPABASE_DATABASE_URL,
+                    max_size=bounded_env_number("DB_POOL_MAX", 8, 1, 20),
+                    timeout=bounded_env_number("DB_POOL_TIMEOUT", 10, 1, 60),
+                    max_idle=bounded_env_number("DB_POOL_MAX_IDLE", 300, 30, 3600),
+                )
+    return POSTGRES_POOL
 
 
 def connect():
     if USE_SUPABASE:
-        return PostgresConnection(SUPABASE_DATABASE_URL)
-    con = sqlite3.connect(DB)
+        pool = get_postgres_pool()
+        return PostgresConnection(connection=pool.get(), pool=pool)
+    con = sqlite3.connect(DB, timeout=30)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys=ON")
+    con.execute("PRAGMA busy_timeout=30000")
+    con.execute("PRAGMA synchronous=NORMAL")
     return con
+
+
+def lock_order_sql(con, order_id):
+    """Serialize quantity-changing work for one order across concurrent users."""
+    if USE_SUPABASE:
+        con.execute("SELECT id FROM orders WHERE id=? FOR UPDATE", (order_id,)).fetchone()
+    else:
+        con.execute("BEGIN IMMEDIATE")
+
+
+def lock_packaging_sql(con, packaging_id):
+    """Prevent two users from shipping or moving the same packages at once."""
+    if USE_SUPABASE:
+        con.execute("SELECT id FROM packaging WHERE id=? FOR UPDATE", (packaging_id,)).fetchone()
+    else:
+        con.execute("BEGIN IMMEDIATE")
+
+
+def lock_production_sql(con, production_id):
+    if USE_SUPABASE:
+        con.execute("SELECT id FROM production WHERE id=? FOR UPDATE", (production_id,)).fetchone()
+    else:
+        con.execute("BEGIN IMMEDIATE")
+
+
+def lock_s_number_sql(con, s_number):
+    if USE_SUPABASE:
+        con.execute("SELECT id FROM orders WHERE s_number=? ORDER BY id FOR UPDATE", (s_number,)).fetchall()
+    else:
+        con.execute("BEGIN IMMEDIATE")
+
+
+def lock_order_sequence_sql(con):
+    if USE_SUPABASE:
+        con.execute("SELECT pg_advisory_xact_lock(714003)").fetchone()
+    else:
+        con.execute("BEGIN IMMEDIATE")
 
 
 SUPABASE_SCHEMA = """
@@ -431,10 +605,17 @@ CREATE TABLE IF NOT EXISTS labor_entries (
   created_by TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_orders_ship_month ON orders(ship_month);
+CREATE INDEX IF NOT EXISTS idx_orders_s_number ON orders(s_number);
+CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at);
+CREATE INDEX IF NOT EXISTS idx_production_order ON production(order_id);
+CREATE INDEX IF NOT EXISTS idx_production_date ON production(produced_at);
 CREATE INDEX IF NOT EXISTS idx_packaging_s_number ON packaging(s_number);
 CREATE INDEX IF NOT EXISTS idx_packaging_order ON packaging(order_id);
+CREATE INDEX IF NOT EXISTS idx_packaging_order_type ON packaging(order_id,package_type);
 CREATE INDEX IF NOT EXISTS idx_shipments_packaging ON shipments(packaging_id);
 CREATE INDEX IF NOT EXISTS idx_shipments_s_number ON shipments(s_number);
+CREATE INDEX IF NOT EXISTS idx_shipments_date ON shipments(shipped_at);
+CREATE INDEX IF NOT EXISTS idx_order_recipients_order ON order_recipients(order_id);
 CREATE INDEX IF NOT EXISTS idx_stock_packaging_production ON stock_packaging(production_id);
 CREATE INDEX IF NOT EXISTS idx_stock_needs_product ON stock_needs(brand,color,unit,created_at);
 CREATE INDEX IF NOT EXISTS idx_stock_need_fulfillments_need ON stock_need_fulfillments(need_id);
@@ -483,6 +664,7 @@ def initialize():
         initialize_supabase()
         return
     with closing(connect()) as con:
+        con.execute("PRAGMA journal_mode=WAL")
         con.executescript("""
         CREATE TABLE IF NOT EXISTS orders (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -641,8 +823,15 @@ def initialize():
         """)
         con.execute("CREATE INDEX IF NOT EXISTS idx_packaging_s_number ON packaging(s_number)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_packaging_order ON packaging(order_id)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_packaging_order_type ON packaging(order_id,package_type)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_shipments_packaging ON shipments(packaging_id)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_shipments_s_number ON shipments(s_number)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_shipments_date ON shipments(shipped_at)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_order_recipients_order ON order_recipients(order_id)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_orders_s_number ON orders(s_number)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_production_order ON production(order_id)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_production_date ON production(produced_at)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_stock_packaging_production ON stock_packaging(production_id)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_stock_needs_product ON stock_needs(brand,color,unit,created_at)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_stock_need_fulfillments_need ON stock_need_fulfillments(need_id)")
@@ -778,6 +967,9 @@ def stock_need_rows_sql(con):
 
 def allocate_stock_need_sql(con, production_id, brand, color, unit, amount):
     available=float(amount); allocated=0.0; now=datetime.now().isoformat(timespec="seconds")
+    if USE_SUPABASE:
+        con.execute("SELECT id FROM stock_needs WHERE brand=? AND color=? AND unit=? ORDER BY id FOR UPDATE",
+                    (brand,color,unit)).fetchall()
     needs=con.execute("""SELECT n.id,n.amount-COALESCE((SELECT SUM(f.amount) FROM stock_need_fulfillments f WHERE f.need_id=n.id),0) remaining
       FROM stock_needs n WHERE n.brand=? AND n.color=? AND n.unit=? AND
       n.amount-COALESCE((SELECT SUM(f.amount) FROM stock_need_fulfillments f WHERE f.need_id=n.id),0)>.0001
@@ -809,6 +1001,8 @@ def release_stock_need_sql(con, production_id, amount):
 
 def dashboard_data():
     today = date.today().isoformat()
+    tomorrow = (date.today() + timedelta(days=1)).isoformat()
+    current_month = today[:7]
     with closing(connect()) as con:
         orders = con.execute("""
           SELECT o.id, o.s_number, o.brand, o.color, o.unit, o.gallons, o.ship_month, o.created_at,
@@ -826,8 +1020,8 @@ def dashboard_data():
         stock_needs = stock_need_rows_sql(con)
         daily = con.execute("""
           SELECT brand,color,unit,ROUND(SUM(gallons),2) gallons FROM production
-          WHERE substr(produced_at,1,10)=? GROUP BY brand,color,unit ORDER BY gallons DESC
-        """, (today,)).fetchall()
+          WHERE produced_at>=? AND produced_at<? GROUP BY brand,color,unit ORDER BY gallons DESC
+        """, (today,tomorrow)).fetchall()
         total = con.execute("""
           SELECT brand,color,unit,ROUND(SUM(gallons),2) gallons FROM production
           GROUP BY brand,color,unit ORDER BY gallons DESC
@@ -839,9 +1033,15 @@ def dashboard_data():
           ORDER BY p.produced_at DESC,p.id DESC LIMIT 12
         """).fetchall()
         order_rows = [dict(x) for x in orders]
+        recipients_by_order = {}
+        recipient_rows = con.execute("""SELECT r.order_id,c.id,c.name,c.email FROM order_recipients r
+          JOIN contacts c ON c.id=r.contact_id WHERE c.active=1 ORDER BY r.order_id,c.name""").fetchall()
+        for recipient in recipient_rows:
+            recipients_by_order.setdefault(recipient["order_id"], []).append({
+                "id": recipient["id"], "name": recipient["name"], "email": recipient["email"]
+            })
         for order in order_rows:
-            order["recipients"] = [dict(x) for x in con.execute("""SELECT c.id,c.name,c.email FROM contacts c
-              JOIN order_recipients r ON r.contact_id=c.id WHERE r.order_id=? ORDER BY c.name""", (order["id"],)).fetchall()]
+            order["recipients"] = recipients_by_order.get(order["id"], [])
         requirement_orders = con.execute("""SELECT o.id,o.s_number,o.brand,o.color,o.gallons,o.unit,o.ship_month
           FROM orders o LEFT JOIN s_number_status s ON s.s_number=o.s_number
           WHERE s.shipped_at IS NULL ORDER BY o.s_number,o.brand,o.color,o.id""").fetchall()
@@ -853,8 +1053,10 @@ def dashboard_data():
           ROUND(CASE WHEN o.gallons-COALESCE(SUM(p.gallons),0)>0
                 THEN o.gallons-COALESCE(SUM(p.gallons),0) ELSE 0 END,2) remaining,
           s.ready_at,s.shipped_at FROM orders o LEFT JOIN production p ON p.order_id=o.id
-          LEFT JOIN s_number_status s ON s.s_number=o.s_number GROUP BY o.id,s.ready_at,s.shipped_at
-          ORDER BY CASE WHEN o.ship_month='' THEN 1 ELSE 0 END,o.ship_month,o.s_number,o.id""").fetchall()
+          LEFT JOIN s_number_status s ON s.s_number=o.s_number
+          WHERE s.shipped_at IS NULL OR o.ship_month>=?
+          GROUP BY o.id,s.ready_at,s.shipped_at
+          ORDER BY CASE WHEN o.ship_month='' THEN 1 ELSE 0 END,o.ship_month,o.s_number,o.id""", (current_month,)).fetchall()
         order_schedule = []
         for raw in schedule_raw:
             row = dict(raw)
@@ -891,7 +1093,8 @@ def dashboard_data():
         """).fetchall()
         shipped = con.execute("""
           SELECT h.id,h.packaging_id,h.s_number,h.brand,h.color,h.package_type,h.package_size,h.package_count,h.gallons,h.shipped_at,h.shipped_by,o.unit
-          FROM shipments h JOIN packaging k ON k.id=h.packaging_id JOIN orders o ON o.id=k.order_id ORDER BY h.shipped_at DESC,h.id DESC
+          FROM shipments h JOIN packaging k ON k.id=h.packaging_id JOIN orders o ON o.id=k.order_id
+          ORDER BY h.shipped_at DESC,h.id DESC LIMIT 250
         """).fetchall()
         shipping_inventory = con.execute("""
           SELECT * FROM (SELECT k.id packaging_id,k.s_number,k.brand,k.color,o.unit,k.package_type,k.package_size,
@@ -908,25 +1111,33 @@ def dashboard_data():
           FROM orders o LEFT JOIN s_number_status s ON s.s_number=o.s_number
           WHERE s.shipped_at IS NULL ORDER BY o.s_number
         """).fetchall()
+        remaining_by_s = {}
+        for row in con.execute("""SELECT s_number,unit,ROUND(SUM(CASE WHEN remaining>0 THEN remaining ELSE 0 END),2) remaining FROM (
+          SELECT o.id,o.s_number,o.unit,o.gallons-COALESCE(SUM(p.gallons),0) remaining
+          FROM orders o LEFT JOIN production p ON p.order_id=o.id GROUP BY o.id
+        ) GROUP BY s_number,unit""").fetchall():
+            remaining_by_s.setdefault(row["s_number"], {})[row["unit"]] = float(row["remaining"])
+        unpackaged_by_s = {}
+        for row in con.execute("""SELECT s_number,unit,ROUND(SUM(CASE WHEN available>0 THEN available ELSE 0 END),2) available FROM (
+          SELECT o.id,o.s_number,o.unit,COALESCE(SUM(p.gallons),0)-
+                 COALESCE((SELECT SUM(k.gallons) FROM packaging k WHERE k.order_id=o.id),0) available
+          FROM orders o LEFT JOIN production p ON p.order_id=o.id GROUP BY o.id
+        ) GROUP BY s_number,unit""").fetchall():
+            unpackaged_by_s.setdefault(row["s_number"], {})[row["unit"]] = float(row["available"])
+        packed_by_s = {row["s_number"]: row for row in con.execute("""SELECT k.s_number,
+          COALESCE(SUM(k.package_count-COALESCE((SELECT SUM(h.package_count) FROM shipments h WHERE h.packaging_id=k.id),0)),0) package_count,
+          COALESCE(SUM((k.package_count-COALESCE((SELECT SUM(h.package_count) FROM shipments h WHERE h.packaging_id=k.id),0))*k.package_size),0) packaged_gallons
+          FROM packaging k GROUP BY k.s_number""").fetchall()}
         s_numbers = []
         for status in statuses:
-            remaining = {x["unit"]: round(float(x["remaining"]),2) for x in con.execute("""
-              SELECT unit,SUM(CASE WHEN remaining>0 THEN remaining ELSE 0 END) remaining FROM (
-                SELECT o.unit,o.gallons-COALESCE((SELECT SUM(p.gallons) FROM production p WHERE p.order_id=o.id),0) remaining
-                FROM orders o WHERE o.s_number=?
-              ) GROUP BY unit""", (status["s_number"],)).fetchall()}
-            unpackaged = {x["unit"]: round(float(x["available"]),2) for x in con.execute("""SELECT unit,
-              SUM(CASE WHEN available>0 THEN available ELSE 0 END) available FROM (
-                SELECT o.unit,COALESCE((SELECT SUM(p.gallons) FROM production p WHERE p.order_id=o.id),0)-
-                       COALESCE((SELECT SUM(k.gallons) FROM packaging k WHERE k.order_id=o.id),0) available
-                FROM orders o WHERE o.s_number=?) GROUP BY unit""", (status["s_number"],)).fetchall()}
-            packed = con.execute("""SELECT COALESCE(SUM(k.package_count-COALESCE((SELECT SUM(h.package_count) FROM shipments h WHERE h.packaging_id=k.id),0)),0),
-              COALESCE(SUM((k.package_count-COALESCE((SELECT SUM(h.package_count) FROM shipments h WHERE h.packaging_id=k.id),0))*k.package_size),0)
-              FROM packaging k WHERE k.s_number=?""", (status["s_number"],)).fetchone()
+            remaining = remaining_by_s.get(status["s_number"], {})
+            unpackaged = unpackaged_by_s.get(status["s_number"], {})
+            packed = packed_by_s.get(status["s_number"])
             s_numbers.append({**dict(status), "remaining_gallons": remaining.get("gallons",0),
                               "remaining_qty": remaining.get("qty",0), "unpackaged_gallons": unpackaged.get("gallons",0),
                               "unpackaged_qty": unpackaged.get("qty",0),
-                              "package_count": int(packed[0]), "packaged_gallons": round(float(packed[1]),2)})
+                              "package_count": int(packed["package_count"]) if packed else 0,
+                              "packaged_gallons": round(float(packed["packaged_gallons"]),2) if packed else 0})
     need_rows=[dict(x) for x in need]
     for stock_need in stock_needs:
         if float(stock_need["remaining"])<=.0001: continue
@@ -942,6 +1153,17 @@ def dashboard_data():
             "inventory": [dict(x) for x in inventory], "shipped": [dict(x) for x in shipped],
             "shipping_inventory": [dict(x) for x in shipping_inventory], "stock_inventory": [dict(x) for x in stock_inventory],
             "packaging_requirements": [dict(x) for x in requirements], "s_numbers": s_numbers,"stock_needs":stock_needs}
+
+
+def cached_dashboard_data():
+    now = time.monotonic()
+    with DASHBOARD_CACHE_LOCK:
+        if DASHBOARD_CACHE["value"] is not None and DASHBOARD_CACHE["expires"] > now:
+            return DASHBOARD_CACHE["value"]
+        value = dashboard_data()
+        DASHBOARD_CACHE["value"] = value
+        DASHBOARD_CACHE["expires"] = time.monotonic() + DASHBOARD_CACHE_TTL
+        return value
 
 
 def admin_data():
@@ -1258,7 +1480,13 @@ def labor_report_csv():
 
 
 class Handler(BaseHTTPRequestHandler):
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(30)
+
     def send_json(self, obj, status=200):
+        if status < 400 and self.command in ("POST", "PUT", "DELETE"):
+            invalidate_dashboard_cache()
         data = json.dumps(obj).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -1268,6 +1496,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def body(self):
         size = int(self.headers.get("Content-Length", 0))
+        if size < 0 or size > MAX_REQUEST_BYTES:
+            raise ValueError("Request is too large.")
         return json.loads(self.rfile.read(size) or b"{}")
 
     def send_csv(self, data, filename):
@@ -1319,6 +1549,12 @@ class Handler(BaseHTTPRequestHandler):
         return user
 
     def do_GET(self):
+        try:
+            return self._do_GET()
+        except DatabaseOperationalError:
+            return self.send_json({"error": "The database is busy. Please try again in a moment."}, 503)
+
+    def _do_GET(self):
         path = urlparse(self.path).path
         if path == "/health":
             try:
@@ -1327,11 +1563,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"ok": True, "database": "supabase" if USE_SUPABASE else "sqlite"})
             except Exception:
                 return self.send_json({"ok": False}, 503)
-        if path == "/api/dashboard": return self.send_json(dashboard_data())
+        if path == "/api/dashboard": return self.send_json(cached_dashboard_data())
         if path == "/app.css": return self.send_file("app.css")
         if path in ("/login", "/login.html"): return self.send_file("login.html")
         if path == "/logout":
-            SESSIONS.pop(self.session_token(), None)
+            clear_session(self.session_token())
             self.send_response(302); self.send_header("Location", "/login")
             self.send_header("Set-Cookie", "ollies_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
             self.end_headers(); return
@@ -1391,6 +1627,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            return self._do_POST()
+        except DatabaseOperationalError:
+            return self.send_json({"error": "The database is busy. Please try again in a moment."}, 503)
+
+    def _do_POST(self):
+        try:
             payload = self.body(); path = urlparse(self.path).path
             if path == "/api/login":
                 login = str(payload.get("email", payload.get("username", ""))).strip().lower(); password = str(payload.get("password", ""))
@@ -1403,7 +1645,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Set-Cookie", f"ollies_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=43200")
                 self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data); return
             if path == "/api/logout":
-                SESSIONS.pop(self.session_token(), None); data = json.dumps({"ok": True}).encode()
+                clear_session(self.session_token()); data = json.dumps({"ok": True}).encode()
                 self.send_response(200); self.send_header("Content-Type", "application/json")
                 self.send_header("Set-Cookie", "ollies_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
                 self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data); return
@@ -1422,8 +1664,9 @@ class Handler(BaseHTTPRequestHandler):
                 if not self.require_role("edit"): return
                 shipment_id = int(undo_match.group(1))
                 with closing(connect()) as con:
-                    shipment = con.execute("SELECT s_number FROM shipments WHERE id=?", (shipment_id,)).fetchone()
+                    shipment = con.execute("SELECT packaging_id,s_number FROM shipments WHERE id=?", (shipment_id,)).fetchone()
                     if not shipment: raise ValueError("Shipment record was not found.")
+                    lock_packaging_sql(con, shipment["packaging_id"])
                     con.execute("DELETE FROM shipments WHERE id=?", (shipment_id,)); refresh_s_number_shipped(con,shipment["s_number"]); con.commit()
                 return self.send_json({"ok": True})
             if path == "/api/shipments":
@@ -1433,6 +1676,7 @@ class Handler(BaseHTTPRequestHandler):
                 if raw_count != package_count or package_count <= 0: raise ValueError("Ship quantity must be a whole number greater than zero.")
                 actor = user.get("display_name") or user.get("email") or user.get("username", "")
                 with closing(connect()) as con:
+                    lock_packaging_sql(con, packaging_id)
                     item = con.execute("""SELECT k.*,s.ready_at,k.package_count-
                       COALESCE((SELECT SUM(h.package_count) FROM shipments h WHERE h.packaging_id=k.id),0) available
                       FROM packaging k LEFT JOIN s_number_status s ON s.s_number=k.s_number WHERE k.id=?""", (packaging_id,)).fetchone()
@@ -1451,6 +1695,7 @@ class Handler(BaseHTTPRequestHandler):
                 s_number, action = status_match.groups(); now = datetime.now().isoformat(timespec="seconds")
                 actor = user.get("display_name") or user.get("email") or user.get("username", "")
                 with closing(connect()) as con:
+                    lock_s_number_sql(con, s_number)
                     if not con.execute("SELECT 1 FROM orders WHERE s_number=?", (s_number,)).fetchone():
                         raise ValueError("S# was not found.")
                     status = con.execute("SELECT done_at,ready_at,shipped_at FROM s_number_status WHERE s_number=?", (s_number,)).fetchone()
@@ -1690,7 +1935,11 @@ class Handler(BaseHTTPRequestHandler):
                 gallons = float(payload.get("gallons", 0)); ship_month = normalize_ship_month(payload.get("ship_month"))
                 if not brand or not color or gallons <= 0: raise ValueError("Enter category, color, and an amount greater than zero.")
                 with closing(connect()) as con:
-                    if not s_number: s_number = next_no_s_reference_sql(con)
+                    if not s_number:
+                        lock_order_sequence_sql(con)
+                        s_number = next_no_s_reference_sql(con)
+                    else:
+                        lock_s_number_sql(con, s_number)
                     closed = con.execute("SELECT done_at,shipped_at FROM s_number_status WHERE s_number=?", (s_number,)).fetchone()
                     if closed and (closed["done_at"] or closed["shipped_at"]): raise ValueError("This order is already ready or shipped and cannot receive another line.")
                     item = con.execute("SELECT unit FROM catalog WHERE category=? AND color=?", (brand,color)).fetchone()
@@ -1728,6 +1977,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Select a package type and enter a whole-number requirement.")
                 user = self.current_user(); actor = user.get("display_name") or user.get("email") or user.get("username", "")
                 with closing(connect()) as con:
+                    lock_order_sql(con, order_id)
                     order = con.execute("""SELECT o.*,s.shipped_at FROM orders o LEFT JOIN s_number_status s
                       ON s.s_number=o.s_number WHERE o.id=?""", (order_id,)).fetchone()
                     if not order: raise ValueError("Order line was not found.")
@@ -1764,6 +2014,7 @@ class Handler(BaseHTTPRequestHandler):
                 user = self.current_user(); actor = user.get("display_name") or user.get("email") or user.get("username", "")
                 with closing(connect()) as con:
                     if source_type == "stock":
+                        lock_production_sql(con, source_id)
                         stock = con.execute("""SELECT p.*,p.gallons-COALESCE((SELECT SUM(k.gallons) FROM stock_packaging k WHERE k.production_id=p.id),0) available
                           FROM production p WHERE p.id=? AND p.order_id IS NULL""", (source_id,)).fetchone()
                         if not stock: raise ValueError("Stock production batch was not found.")
@@ -1775,6 +2026,7 @@ class Handler(BaseHTTPRequestHandler):
                           datetime.now().isoformat(timespec="seconds"),actor))
                         labor_cost=record_labor_sql(con,payload,production=stock,process_name="Filling / Packaging",actor=actor)
                     else:
+                        lock_order_sql(con, source_id)
                         order = con.execute("""SELECT o.id,o.s_number,o.brand,o.color,o.unit,s.done_at,s.shipped_at,
                           COALESCE((SELECT SUM(p.gallons) FROM production p WHERE p.order_id=o.id),0)-
                           COALESCE((SELECT SUM(k.gallons) FROM packaging k WHERE k.order_id=o.id),0) available
@@ -1798,6 +2050,7 @@ class Handler(BaseHTTPRequestHandler):
                 oid = int(payload.get("order_id", 0)); batch = str(payload.get("batch_number", "")).strip()
                 gallons = float(payload.get("gallons", 0))
                 with closing(connect()) as con:
+                    lock_order_sql(con, oid)
                     row = con.execute("""SELECT o.id,o.s_number,o.brand,o.color,o.unit,o.gallons-COALESCE(SUM(p.gallons),0) remaining,
                       s.done_at,s.shipped_at FROM orders o LEFT JOIN production p ON p.order_id=o.id
                       LEFT JOIN s_number_status s ON s.s_number=o.s_number WHERE o.id=?
@@ -1824,6 +2077,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not batch or gallons <= 0 or not produced_at: raise ValueError("Enter batch number, gallons, and production date.")
                 with closing(connect()) as con:
                     if order_id is not None:
+                        lock_order_sql(con, order_id)
                         order = con.execute("""SELECT o.id,o.s_number,o.brand,o.color,o.unit,o.gallons-COALESCE(SUM(p.gallons),0) remaining,
                           s.done_at,s.shipped_at FROM orders o LEFT JOIN production p ON p.order_id=o.id
                           LEFT JOIN s_number_status s ON s.s_number=o.s_number WHERE o.id=?
@@ -1860,6 +2114,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": str(e)}, 400)
 
     def do_PUT(self):
+        try:
+            return self._do_PUT()
+        except DatabaseOperationalError:
+            return self.send_json({"error": "The database is busy. Please try again in a moment."}, 503)
+
+    def _do_PUT(self):
         try:
             payload = self.body()
             if not self.require_role("edit"): return
@@ -1928,6 +2188,7 @@ class Handler(BaseHTTPRequestHandler):
                 if package_type not in PACKAGE_TYPES or raw_count != package_count or package_count <= 0 or not packaged_at:
                     raise ValueError("Select a package type, enter a whole-number count, and provide the packaged date.")
                 with closing(connect()) as con:
+                    lock_packaging_sql(con, record_id)
                     item = con.execute("""SELECT k.order_id,k.s_number,k.package_type,k.package_size,o.unit,s.shipped_at,
                       COALESCE((SELECT SUM(h.package_count) FROM shipments h WHERE h.packaging_id=k.id),0) shipped_count,
                       COALESCE((SELECT SUM(p.gallons) FROM production p WHERE p.order_id=k.order_id),0)-
@@ -1946,6 +2207,9 @@ class Handler(BaseHTTPRequestHandler):
                 raw_count = float(payload.get("package_count", 0)); package_count = int(raw_count)
                 if raw_count != package_count or package_count <= 0: raise ValueError("Shipped quantity must be a whole number greater than zero.")
                 with closing(connect()) as con:
+                    shipment_ref = con.execute("SELECT packaging_id FROM shipments WHERE id=?", (record_id,)).fetchone()
+                    if not shipment_ref: raise ValueError("Shipment record was not found.")
+                    lock_packaging_sql(con, shipment_ref["packaging_id"])
                     item = con.execute("""SELECT h.packaging_id,h.s_number,k.package_count,k.package_size,
                       COALESCE((SELECT SUM(x.package_count) FROM shipments x WHERE x.packaging_id=h.packaging_id AND x.id<>h.id),0) other_shipped
                       FROM shipments h JOIN packaging k ON k.id=h.packaging_id WHERE h.id=?""", (record_id,)).fetchone()
@@ -1959,6 +2223,9 @@ class Handler(BaseHTTPRequestHandler):
                 raw_count = float(payload.get("required_count", 0)); required_count = int(raw_count)
                 if raw_count != required_count or required_count <= 0: raise ValueError("Required quantity must be a whole number greater than zero.")
                 with closing(connect()) as con:
+                    requirement_ref = con.execute("SELECT order_id FROM packaging_requirements WHERE id=?", (record_id,)).fetchone()
+                    if not requirement_ref: raise ValueError("Packaging requirement was not found.")
+                    lock_order_sql(con, requirement_ref["order_id"])
                     item = con.execute("""SELECT r.*,o.gallons order_gallons FROM packaging_requirements r
                       JOIN orders o ON o.id=r.order_id WHERE r.id=?""", (record_id,)).fetchone()
                     if not item: raise ValueError("Packaging requirement was not found.")
@@ -1974,6 +2241,7 @@ class Handler(BaseHTTPRequestHandler):
                 gallons = float(payload.get("gallons", 0)); created_at = str(payload.get("created_at", "")).strip(); ship_month = normalize_ship_month(payload.get("ship_month"))
                 if not brand or not color or gallons <= 0 or not created_at: raise ValueError("Complete every order field.")
                 with closing(connect()) as con:
+                    lock_order_sql(con, record_id)
                     old = con.execute("""SELECT o.*,s.shipped_at FROM orders o LEFT JOIN s_number_status s
                       ON s.s_number=o.s_number WHERE o.id=?""", (record_id,)).fetchone()
                     if not old: raise ValueError("Order was not found.")
@@ -2003,6 +2271,7 @@ class Handler(BaseHTTPRequestHandler):
                 gallons = float(payload.get("gallons", 0)); produced_at = str(payload.get("produced_at", "")).strip()
                 if not batch or gallons <= 0 or not produced_at: raise ValueError("Complete every batch field.")
                 with closing(connect()) as con:
+                    lock_production_sql(con, record_id)
                     old=con.execute("SELECT * FROM production WHERE id=?",(record_id,)).fetchone()
                     if not old: raise ValueError("Batch was not found.")
                     allocated=float(con.execute("SELECT COALESCE(SUM(amount),0) FROM stock_need_fulfillments WHERE production_id=?",(record_id,)).fetchone()[0])
@@ -2055,6 +2324,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": str(e)}, 400)
 
     def do_DELETE(self):
+        try:
+            return self._do_DELETE()
+        except DatabaseOperationalError:
+            return self.send_json({"error": "The database is busy. Please try again in a moment."}, 503)
+
+    def _do_DELETE(self):
         if not self.require_role("delete"): return
         try:
             parts = urlparse(self.path).path.strip("/").split("/")
@@ -2062,11 +2337,13 @@ class Handler(BaseHTTPRequestHandler):
             kind, record_id = parts[2], int(parts[3])
             with closing(connect()) as con:
                 if kind == "batches":
+                    lock_production_sql(con, record_id)
                     if con.execute("SELECT 1 FROM labor_entries WHERE production_id=?", (record_id,)).fetchone():
                         raise ValueError("Delete this batch's labor entries in Labor Costing before deleting the batch.")
                     cur = con.execute("DELETE FROM production WHERE id=?", (record_id,))
                     if not cur.rowcount: raise ValueError("Batch was not found.")
                 elif kind == "packaging":
+                    lock_packaging_sql(con, record_id)
                     item = con.execute("""SELECT k.s_number,s.shipped_at FROM packaging k LEFT JOIN s_number_status s
                       ON s.s_number=k.s_number WHERE k.id=?""", (record_id,)).fetchone()
                     if not item: raise ValueError("Packaging record was not found.")
@@ -2075,6 +2352,9 @@ class Handler(BaseHTTPRequestHandler):
                     con.execute("DELETE FROM packaging WHERE id=?", (record_id,))
                     refresh_s_number_ready(con,item["s_number"],self.current_user().get("display_name","System"))
                 elif kind == "requirements":
+                    requirement_ref = con.execute("SELECT order_id FROM packaging_requirements WHERE id=?", (record_id,)).fetchone()
+                    if not requirement_ref: raise ValueError("Packaging requirement was not found.")
+                    lock_order_sql(con, requirement_ref["order_id"])
                     item = con.execute("SELECT s_number FROM packaging_requirements WHERE id=?", (record_id,)).fetchone()
                     if not item: raise ValueError("Packaging requirement was not found.")
                     con.execute("DELETE FROM packaging_requirements WHERE id=?", (record_id,))
@@ -2091,6 +2371,7 @@ class Handler(BaseHTTPRequestHandler):
                     cur=con.execute("DELETE FROM stock_needs WHERE id=?",(record_id,))
                     if not cur.rowcount: raise ValueError("Production need was not found.")
                 elif kind == "orders":
+                    lock_order_sql(con, record_id)
                     count = con.execute("SELECT COUNT(*) FROM production WHERE order_id=?", (record_id,)).fetchone()[0]
                     if count: raise ValueError("Delete this order's batches first.")
                     if con.execute("SELECT 1 FROM labor_entries WHERE order_id=?",(record_id,)).fetchone(): raise ValueError("Delete this order's labor entries first.")
@@ -2120,6 +2401,32 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+    request_queue_size = 128
+
+    def __init__(self, server_address, handler_class):
+        self.request_slots = threading.BoundedSemaphore(
+            bounded_env_number("MAX_REQUEST_THREADS", 32, 4, 64)
+        )
+        super().__init__(server_address, handler_class)
+
+    def process_request(self, request, client_address):
+        self.request_slots.acquire()
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.request_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.request_slots.release()
+
+
 def main():
     initialize()
     port = int(os.environ.get("PORT", "8765"))
@@ -2146,7 +2453,7 @@ def main():
         print(f"TV dashboard: http://{lan_ip}:{port}/tv")
         threading.Timer(0.8, lambda: webbrowser.open(local_url)).start()
     print("Keep this process running. Press Ctrl+C to stop.\n")
-    ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
+    BoundedThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
 
 if __name__ == "__main__":
