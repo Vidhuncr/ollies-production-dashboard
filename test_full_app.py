@@ -6,6 +6,11 @@ from http.server import ThreadingHTTPServer
 
 import app_sqlite_backup as app
 
+# The full application test must always use its disposable SQLite database,
+# even when a developer has a live Supabase URL in the local .env file.
+app.USE_SUPABASE = False
+app.SUPABASE_DATABASE_URL = ""
+
 
 TEST_DB = Path(__file__).with_name("test_full_app.db")
 if TEST_DB.exists():

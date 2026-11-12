@@ -21,3 +21,9 @@ services:
         value: America/Chicago
       - key: EMAIL_ENABLED
         value: "false"
+      - key: EMAIL_PROVIDER
+        value: google_apps_script
+      - key: GOOGLE_APPS_SCRIPT_URL
+        sync: false
+      - key: GOOGLE_APPS_SCRIPT_SECRET
+        sync: false

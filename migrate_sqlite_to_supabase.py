@@ -62,6 +62,11 @@ def migrate():
         if populated:
             raise SystemExit("Supabase already contains production data (" + ", ".join(populated) + "). Migration stopped without changing it.")
 
+        # The validation queries above start psycopg's implicit transaction.
+        # End that read-only transaction so the transaction below is a real
+        # top-level transaction and is committed when its context exits.
+        target.commit()
+
         with target.transaction():
             with target.cursor() as cursor:
                 catalog_columns, catalog_rows = sqlite_rows(source, "catalog")

@@ -58,18 +58,21 @@ Render Blueprint and enter these secret environment variables:
 
 Optional email variables:
 
+  EMAIL_PROVIDER
   GMAIL_ADDRESS
   GMAIL_APP_PASSWORD
+  GOOGLE_APPS_SCRIPT_URL
+  GOOGLE_APPS_SCRIPT_SECRET
 
 See GITHUB_RENDER_EMAIL_SETUP.md for the complete GitHub, Render, Supabase, and
 Gmail instructions. DEPLOY_RENDER.md contains the shorter deployment reference.
 
 RENDER FREE EMAIL LIMITATION
 
-Render Free blocks Gmail SMTP ports. Keep EMAIL_ENABLED=false on the Free web
-service. Local Gmail notifications work with EMAIL_ENABLED=true. After moving
-the Render service to a paid plan, set EMAIL_ENABLED=true and add GMAIL_ADDRESS
-and GMAIL_APP_PASSWORD in Render Environment settings.
+Render Free blocks Gmail SMTP ports. For Gmail notifications on the Free
+service, use the Google Apps Script HTTPS relay described in
+EMAIL_SETUP_APPS_SCRIPT.md. Local Gmail SMTP notifications still work with
+EMAIL_PROVIDER=gmail_smtp.
 
 
 LOGIN ROLES

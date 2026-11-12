@@ -24,6 +24,7 @@ migration = (ROOT / "migrate_sqlite_to_supabase.py").read_text(encoding="utf-8")
 assert "psycopg" in requirements
 assert "SUPABASE_DATABASE_URL" in render
 assert "EMAIL_ENABLED" in render and 'value: "false"' in render
+assert "EMAIL_PROVIDER" in render and "GOOGLE_APPS_SCRIPT_URL" in render and "GOOGLE_APPS_SCRIPT_SECRET" in render
 assert "*.db" in gitignore and ".env" in gitignore and ".venv/" in gitignore
 assert "backend.main()" in entrypoint
 assert "SUPABASE_DATABASE_URL" in migration

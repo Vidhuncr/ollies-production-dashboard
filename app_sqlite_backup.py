@@ -19,7 +19,9 @@ from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from email.message import EmailMessage
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 try:
     import psycopg
@@ -53,6 +55,9 @@ APP_PASSWORD = os.environ.get("APP_PASSWORD", "Ollies123!")
 GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS", "").strip()
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "").replace(" ", "").strip()
 EMAIL_ENABLED = os.environ.get("EMAIL_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+EMAIL_PROVIDER = os.environ.get("EMAIL_PROVIDER", "gmail_smtp").strip().lower()
+GOOGLE_APPS_SCRIPT_URL = os.environ.get("GOOGLE_APPS_SCRIPT_URL", "").strip()
+GOOGLE_APPS_SCRIPT_SECRET = os.environ.get("GOOGLE_APPS_SCRIPT_SECRET", "").strip()
 SESSIONS = {}
 DatabaseIntegrityError = (sqlite3.IntegrityError, PsycopgIntegrityError)
 PACKAGE_TYPES = {
@@ -990,28 +995,63 @@ def user_data():
         return [dict(x) for x in con.execute("SELECT id,username,email,display_name,role,active,created_at FROM users ORDER BY active DESC,display_name,email,username").fetchall()]
 
 
-def send_production_email(order_id, batch_number, produced_amount, remaining):
-    with closing(connect()) as con:
-        order = con.execute("SELECT s_number,brand,color,unit FROM orders WHERE id=?", (order_id,)).fetchone()
-        recipients = con.execute("""SELECT c.email FROM contacts c JOIN order_recipients r ON r.contact_id=c.id
-          WHERE r.order_id=? AND c.active=1 ORDER BY c.email""", (order_id,)).fetchall()
-    if not order or not recipients: return None
-    if not EMAIL_ENABLED: return "Production saved; email notifications are disabled for this environment."
-    if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD: return "Production saved, but Gmail is not configured."
-    unit = "qty" if order["unit"] == "qty" else "gallons"; complete = remaining <= .0001
-    subject = f"{order['s_number']} - {'Production complete' if complete else 'Partial production update'}"
-    status = "COMPLETE" if complete else "PARTIALLY PRODUCED"
-    body = (f"S#: {order['s_number']}\nCategory: {order['brand']}\nColor: {order['color']}\n"
-            f"Batch #: {batch_number}\nStatus: {status}\nProduced this batch: {produced_amount:g} {unit}\n"
-            f"Need to produce: {max(remaining,0):g} {unit}\n")
+def deliver_notification_email(recipient_emails, subject, body):
+    recipients = [str(email or "").strip() for email in recipient_emails if valid_email(email)]
+    if not recipients:
+        return None
+    if not EMAIL_ENABLED:
+        return "Production saved; email notifications are disabled for this environment."
+    if EMAIL_PROVIDER == "google_apps_script":
+        if not GOOGLE_APPS_SCRIPT_URL.startswith("https://script.google.com/") or not GOOGLE_APPS_SCRIPT_SECRET:
+            return "Production saved, but Google Apps Script email is not configured."
+        try:
+            request = Request(
+                GOOGLE_APPS_SCRIPT_URL,
+                data=json.dumps({
+                    "secret": GOOGLE_APPS_SCRIPT_SECRET,
+                    "to": recipients,
+                    "subject": subject,
+                    "body": body,
+                }).encode("utf-8"),
+                method="POST",
+                headers={"content-type": "application/json"},
+            )
+            with urlopen(request, timeout=20) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            if not result.get("ok"):
+                raise RuntimeError(str(result.get("error") or "Apps Script rejected the request"))
+            return f"Email sent to {len(recipients)} recipient(s)."
+        except HTTPError as exc:
+            return f"Production saved, but Google Apps Script email failed with HTTP {exc.code}."
+        except (URLError, TimeoutError, OSError) as exc:
+            return f"Production saved, but Google Apps Script email failed: {exc}."
+        except (ValueError, RuntimeError) as exc:
+            return f"Production saved, but Google Apps Script email failed: {exc}."
+    if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD:
+        return "Production saved, but Gmail is not configured."
     message = EmailMessage(); message["From"] = GMAIL_ADDRESS
-    message["To"] = ", ".join(x["email"] for x in recipients); message["Subject"] = subject; message.set_content(body)
+    message["To"] = ", ".join(recipients); message["Subject"] = subject; message.set_content(body)
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as smtp:
             smtp.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD); smtp.send_message(message)
         return f"Email sent to {len(recipients)} recipient(s)."
     except Exception as exc:
         return f"Production saved, but email failed: {exc}"
+
+
+def send_production_email(order_id, batch_number, produced_amount, remaining):
+    with closing(connect()) as con:
+        order = con.execute("SELECT s_number,brand,color,unit FROM orders WHERE id=?", (order_id,)).fetchone()
+        recipients = con.execute("""SELECT c.email FROM contacts c JOIN order_recipients r ON r.contact_id=c.id
+          WHERE r.order_id=? AND c.active=1 ORDER BY c.email""", (order_id,)).fetchall()
+    if not order or not recipients: return None
+    unit = "qty" if order["unit"] == "qty" else "gallons"; complete = remaining <= .0001
+    subject = f"{order['s_number']} - {'Production complete' if complete else 'Partial production update'}"
+    status = "COMPLETE" if complete else "PARTIALLY PRODUCED"
+    body = (f"S#: {order['s_number']}\nCategory: {order['brand']}\nColor: {order['color']}\n"
+            f"Batch #: {batch_number}\nStatus: {status}\nProduced this batch: {produced_amount:g} {unit}\n"
+            f"Need to produce: {max(remaining,0):g} {unit}\n")
+    return deliver_notification_email([x["email"] for x in recipients], subject, body)
 
 
 def catalog_data():

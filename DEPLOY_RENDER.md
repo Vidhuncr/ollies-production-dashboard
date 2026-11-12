@@ -72,9 +72,9 @@ All devices and networks will use the same data stored in Supabase.
 
 ## Gmail and Render Free
 
-Render Free blocks Gmail SMTP ports, so `EMAIL_ENABLED` is set to `false` in the
-Blueprint. Local Gmail notifications can still be used. After upgrading the
-Render service to a paid instance, set `EMAIL_ENABLED=true` and add
-`GMAIL_ADDRESS` and `GMAIL_APP_PASSWORD` under Render **Environment**.
+Render Free blocks Gmail SMTP ports. To send cloud notifications on the Free
+service, configure the Google Apps Script HTTPS relay using
+`EMAIL_SETUP_APPS_SCRIPT.md`. Local Gmail SMTP notifications can still be used.
+After upgrading Render, Gmail App Password SMTP can also be enabled.
 
 See `GITHUB_RENDER_EMAIL_SETUP.md` for the complete GitHub and Gmail steps.

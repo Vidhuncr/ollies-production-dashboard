@@ -66,8 +66,9 @@ database backups, dumps, logs, and editor settings.
 7. Wait until the service shows **Live** and `/health` passes.
 8. Open the assigned `https://...onrender.com` address.
 
-On the Free plan, `EMAIL_ENABLED` remains `false`. Supabase stores the permanent
-data, so Render restarts and redeployments do not erase production records.
+Supabase stores the permanent data, so Render restarts and redeployments do not
+erase production records. To enable email on the Free plan, follow
+`EMAIL_SETUP_APPS_SCRIPT.md` after the first successful deployment.
 
 ## 5. Gmail notifications locally
 
@@ -81,6 +82,7 @@ includes the batch amount and the quantity or gallons still needed.
 
 ```text
 EMAIL_ENABLED=true
+EMAIL_PROVIDER=gmail_smtp
 GMAIL_ADDRESS=your-account@gmail.com
 GMAIL_APP_PASSWORD=your-16-character-app-password
 ```
@@ -107,11 +109,16 @@ a paid instance:
 If the Google account password is changed, Google revokes existing App Passwords;
 create a new one and update the Render secret.
 
+While remaining on Render Free, use the Google Apps Script HTTPS relay described
+in `EMAIL_SETUP_APPS_SCRIPT.md`. It uses a private shared webhook secret instead
+of an App Password.
+
 ## 7. Free-plan expectations
 
 - The service sleeps after 15 minutes without traffic and can take about one
   minute to wake up.
 - Gmail SMTP cannot send from the Free web service.
+- Google Apps Script notifications can send from the Free service over HTTPS.
 - Data remains safe because it is stored in Supabase, not Render's temporary disk.
 - After moving to a paid Render instance, the service no longer has the Free
   SMTP restriction and Gmail notifications can be enabled as described above.
