@@ -111,6 +111,15 @@ try:
     costing, _ = ok("GET", "/api/costing", token=admin)
     rate_id = costing["current_rates"][0]["id"]
 
+    multi_gal, _ = ok("POST", "/api/orders", {"s_number": "S10999", "brand": "Paint", "color": "Blue", "gallons": 2, "ship_month": "2027-04"}, team, 201)
+    multi_qty, _ = ok("POST", "/api/orders", {"s_number": "S10999", "brand": "Parts", "color": "Red", "gallons": 30, "ship_month": "2027-04"}, team, 201)
+    multi_detail, _ = ok("GET", "/api/s-numbers/S10999/detail", token=admin)
+    assert multi_detail["status"] == "Not Started" and len(multi_detail["orders"]) == 2
+    assert multi_detail["totals"]["ordered_gallons"] == 2 and multi_detail["totals"]["ordered_qty"] == 30
+    assert {x["brand"] for x in multi_detail["orders"]} == {"Paint", "Parts"}
+    ok("DELETE", f"/api/admin/orders/{multi_gal['id']}", token=admin)
+    ok("DELETE", f"/api/admin/orders/{multi_qty['id']}", token=admin)
+
     ok("POST", "/api/orders", {"s_number": "S10001", "brand": "Paint", "color": "Blue", "gallons": 100, "ship_month": "2026-11"}, team, 201)
     dashboard, _ = ok("GET", "/api/dashboard")
     gallon_order = next(x for x in dashboard["orders"] if x["s_number"] == "S10001")
@@ -155,6 +164,17 @@ try:
     ok("POST", "/api/packaging", {"source_type": "order", "source_id": qty_order["id"], "package_type": "case_pack", "package_size": 10, "package_count": 5, "rate_id": rate_id, "labor_hours": 0.5}, team, 201)
     dashboard, _ = ok("GET", "/api/dashboard")
     assert next(x for x in dashboard["s_numbers"] if x["s_number"] == "S10002")["ready_at"]
+    assert call("GET", "/api/s-numbers/S10002/detail")[0] == 401
+    detail, _ = ok("GET", "/api/s-numbers/S10002/detail", token=admin)
+    assert detail["status"] == "Ready" and detail["totals"]["ordered_qty"] == 50
+    assert detail["totals"]["produced_qty"] == 50 and detail["totals"]["remaining_qty"] == 0
+    assert detail["orders"][0]["brand"] == "Parts" and detail["orders"][0]["color"] == "Red"
+    assert detail["requirements"][0]["package_type"] == "case_pack"
+    assert detail["requirements"][0]["package_size"] == 10 and detail["requirements"][0]["required_count"] == 5
+    assert detail["requirements"][0]["completed_count"] == 5
+    assert detail["packages"][0]["package_count"] == 5 and detail["packages"][0]["available_count"] == 5
+    assert detail["batches"][0]["batch_number"] == "Q-BATCH-1" and detail["labor"]["cost"] > 0
+    assert call("GET", "/api/s-numbers/S00000/detail", token=admin)[0] == 404
 
     need_result, _ = ok("POST", "/api/stock-needs", {"brand": "Paint", "color": "Blue", "amount": 15, "note": "Order pending S#"}, team, 201)
     need_id = need_result["id"]
@@ -325,8 +345,10 @@ try:
         assert call("GET", route, token=admin)[0] == 200, route
     tv_page = call("GET", "/tv", token=admin)[1]
     production_page = call("GET", "/production", token=admin)[1]
+    dashboard_page = call("GET", "/", token=admin)[1]
     assert b"Changes every 15 seconds" in tv_page and b"Orders by Ship Month" in tv_page
     assert b"Orders by Ship Month" in production_page and b'type="month"' in production_page
+    assert b"showOrderDetail" in dashboard_page and b"Packaging Requirements" in dashboard_page
     for route in ("/api/reports/category.csv", "/api/reports/labor.csv"):
         assert call("GET", route, token=admin)[0] == 200, route
     report, _ = ok("GET", "/api/reporting", token=admin)

@@ -21,7 +21,7 @@ from pathlib import Path
 from email.message import EmailMessage
 from queue import Empty, Full, LifoQueue
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 from urllib.request import Request, urlopen
 
 try:
@@ -1215,6 +1215,89 @@ def dashboard_data():
             "packaging_requirements": [dict(x) for x in requirements], "s_numbers": s_numbers,"stock_needs":stock_needs}
 
 
+def s_number_detail(s_number):
+    """Return the complete, read-only production story for one order reference."""
+    reference = str(s_number or "").strip().upper()
+    if not reference:
+        return None
+    with closing(connect()) as con:
+        orders = [dict(x) for x in con.execute("""SELECT o.id,o.s_number,o.brand,o.color,o.unit,o.gallons,
+          o.ship_month,o.created_at,
+          ROUND(COALESCE((SELECT SUM(p.gallons) FROM production p WHERE p.order_id=o.id),0),2) produced,
+          ROUND(COALESCE((SELECT SUM(k.gallons) FROM packaging k WHERE k.order_id=o.id),0),2) packaged,
+          ROUND(COALESCE((SELECT SUM(h.gallons) FROM shipments h JOIN packaging k ON k.id=h.packaging_id
+            WHERE k.order_id=o.id),0),2) shipped
+          FROM orders o WHERE o.s_number=? ORDER BY o.brand,o.color,o.id""", (reference,)).fetchall()]
+        if not orders:
+            return None
+        status_row = con.execute("SELECT * FROM s_number_status WHERE s_number=?", (reference,)).fetchone()
+        status = dict(status_row) if status_row else {"s_number": reference, "done_at": None, "done_by": None,
+          "ready_at": None, "ready_by": None, "shipped_at": None, "shipped_by": None}
+        batches = [dict(x) for x in con.execute("""SELECT p.id,p.order_id,p.batch_number,p.brand,p.color,p.unit,
+          p.gallons,p.produced_at FROM production p JOIN orders o ON o.id=p.order_id
+          WHERE o.s_number=? ORDER BY p.produced_at,p.id""", (reference,)).fetchall()]
+        requirements = [dict(x) for x in con.execute("""SELECT r.id,r.order_id,r.brand,r.color,o.unit,
+          r.package_type,r.package_size,r.required_count,r.required_gallons,
+          COALESCE((SELECT SUM(k.package_count) FROM packaging k WHERE k.order_id=r.order_id
+            AND k.package_type=r.package_type AND ABS(k.package_size-r.package_size)<.0001),0) completed_count,
+          COALESCE((SELECT SUM(h.package_count) FROM shipments h JOIN packaging k ON k.id=h.packaging_id
+            WHERE k.order_id=r.order_id AND k.package_type=r.package_type
+            AND ABS(k.package_size-r.package_size)<.0001),0) shipped_count
+          FROM packaging_requirements r JOIN orders o ON o.id=r.order_id
+          WHERE r.s_number=? ORDER BY r.brand,r.color,r.package_size DESC""", (reference,)).fetchall()]
+        packages = [dict(x) for x in con.execute("""SELECT k.id,k.order_id,k.brand,k.color,o.unit,k.package_type,
+          k.package_size,k.package_count,k.gallons,k.packaged_at,k.created_by,
+          COALESCE((SELECT SUM(h.package_count) FROM shipments h WHERE h.packaging_id=k.id),0) shipped_count,
+          k.package_count-COALESCE((SELECT SUM(h.package_count) FROM shipments h WHERE h.packaging_id=k.id),0) available_count
+          FROM packaging k JOIN orders o ON o.id=k.order_id WHERE k.s_number=?
+          ORDER BY k.brand,k.color,k.package_size DESC,k.id""", (reference,)).fetchall()]
+        recipients = [dict(x) for x in con.execute("""SELECT DISTINCT c.id,c.name,c.email,c.active
+          FROM order_recipients r JOIN contacts c ON c.id=r.contact_id JOIN orders o ON o.id=r.order_id
+          WHERE o.s_number=? ORDER BY c.name,c.email""", (reference,)).fetchall()]
+        labor = con.execute("""SELECT ROUND(COALESCE(SUM(hours),0),2) hours,
+          ROUND(COALESCE(SUM(labor_cost),0),2) cost FROM labor_entries WHERE s_number=?""", (reference,)).fetchone()
+
+    totals = {"ordered_gallons": 0.0, "ordered_qty": 0.0, "produced_gallons": 0.0,
+      "produced_qty": 0.0, "remaining_gallons": 0.0, "remaining_qty": 0.0,
+      "unpackaged_gallons": 0.0, "unpackaged_qty": 0.0, "inventory_gallons": 0.0,
+      "inventory_qty": 0.0, "shipped_gallons": 0.0, "shipped_qty": 0.0}
+    for order in orders:
+        ordered = float(order["gallons"])
+        produced = float(order["produced"])
+        packaged = float(order["packaged"])
+        shipped = float(order["shipped"])
+        remaining = round(max(ordered - produced, 0), 2)
+        unpackaged = round(max(produced - packaged, 0), 2)
+        inventory = round(max(packaged - shipped, 0), 2)
+        order.update({"remaining": remaining, "unpackaged": unpackaged, "inventory": inventory})
+        if remaining > .0001:
+            order["status"] = "In Production" if produced > .0001 else "Not Started"
+        elif unpackaged > .0001 or packaged + .0001 < ordered:
+            order["status"] = "Packaging"
+        elif status.get("shipped_at"):
+            order["status"] = "Shipped"
+        elif status.get("ready_at"):
+            order["status"] = "Ready"
+        else:
+            order["status"] = "Packaging"
+        suffix = "qty" if order["unit"] == "qty" else "gallons"
+        totals[f"ordered_{suffix}"] += ordered
+        totals[f"produced_{suffix}"] += produced
+        totals[f"remaining_{suffix}"] += remaining
+        totals[f"unpackaged_{suffix}"] += unpackaged
+        totals[f"inventory_{suffix}"] += inventory
+        totals[f"shipped_{suffix}"] += shipped
+    totals = {key: round(value, 2) for key, value in totals.items()}
+    has_remaining = totals["remaining_gallons"] > .0001 or totals["remaining_qty"] > .0001
+    has_production = totals["produced_gallons"] > .0001 or totals["produced_qty"] > .0001
+    overall_status = "Shipped" if status.get("shipped_at") else "Ready" if status.get("ready_at") else (
+      ("In Production" if has_production else "Not Started") if has_remaining else "Packaging")
+    return {"s_number": reference, "status": overall_status, "status_history": status,
+      "ship_months": sorted({x["ship_month"] for x in orders if x["ship_month"]}), "totals": totals,
+      "orders": orders, "batches": batches, "requirements": requirements, "packages": packages,
+      "recipients": recipients, "labor": {"hours": float(labor["hours"]), "cost": float(labor["cost"])} if labor else {"hours": 0, "cost": 0}}
+
+
 def cached_dashboard_data():
     now = time.monotonic()
     with DASHBOARD_CACHE_LOCK:
@@ -1634,6 +1717,11 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 return self.send_json({"ok": False}, 503)
         if path == "/api/dashboard": return self.send_json(cached_dashboard_data())
+        detail_match = re.fullmatch(r"/api/s-numbers/([^/]+)/detail", path)
+        if detail_match:
+            if not self.authorized(): return
+            detail = s_number_detail(unquote(detail_match.group(1)))
+            return self.send_json(detail, 200) if detail else self.send_json({"error": "Order / S# was not found."}, 404)
         if path == "/app.css": return self.send_file("app.css")
         if path in ("/login", "/login.html"): return self.send_file("login.html")
         if path == "/logout":
