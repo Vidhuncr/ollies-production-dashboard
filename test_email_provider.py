@@ -57,6 +57,7 @@ try:
 
     app.EMAIL_ENABLED = False
     assert "disabled" in app.deliver_notification_email(["recipient@example.com"], "Test", "Test").lower()
+    assert app.deliver_notification_email(["recipient@example.com"], "New order", "Order", "Order saved").startswith("Order saved;")
 finally:
     for key, value in original.items():
         setattr(app, key, value)

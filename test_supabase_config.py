@@ -12,6 +12,8 @@ assert dict(row) == {"id": 7, "amount": 12.5}
 assert backend.postgres_sql("SELECT * FROM orders WHERE id=?") == "SELECT * FROM orders WHERE id=%s"
 assert "CREATE TABLE IF NOT EXISTS orders" in backend.SUPABASE_SCHEMA
 assert "ship_month TEXT" in backend.SUPABASE_SCHEMA
+assert "po_number TEXT" in backend.SUPABASE_SCHEMA
+assert "ALTER TABLE orders ADD COLUMN IF NOT EXISTS po_number" in backend.SUPABASE_SCHEMA
 assert "packaging_requirements" in backend.SUPABASE_SCHEMA
 assert "labor_entries" in backend.SUPABASE_SCHEMA
 assert "ENABLE ROW LEVEL SECURITY" in backend.SUPABASE_SCHEMA
@@ -31,6 +33,7 @@ assert "idx_production_order" in backend.SUPABASE_SCHEMA and "idx_packaging_orde
 assert hasattr(backend, "PostgresPool") and hasattr(backend, "BoundedThreadingHTTPServer")
 assert hasattr(backend, "decode_session") and "hmac.new(SESSION_SECRET" in Path(backend.__file__).read_text(encoding="utf-8")
 assert "saveContact" in admin_page and "contactActive" in admin_page and "Email recipient updated" in admin_page
+assert "poNumber" in admin_page and hasattr(backend, "send_order_created_email")
 assert "*.db" in gitignore and ".env" in gitignore and ".venv/" in gitignore
 assert "backend.main()" in entrypoint
 assert "SUPABASE_DATABASE_URL" in migration

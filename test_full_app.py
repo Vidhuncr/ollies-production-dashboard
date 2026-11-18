@@ -10,6 +10,7 @@ import app_sqlite_backup as app
 # even when a developer has a live Supabase URL in the local .env file.
 app.USE_SUPABASE = False
 app.SUPABASE_DATABASE_URL = ""
+app.EMAIL_ENABLED = False
 
 
 TEST_DB = Path(__file__).with_name("test_full_app.db")
@@ -100,6 +101,8 @@ try:
     ok("POST", "/api/catalog", {"category": "Paint", "color": "Red", "unit": "gallons"}, team, 201)
     ok("POST", "/api/catalog", {"category": "Parts", "color": "Red", "unit": "qty"}, team, 201)
     ok("POST", "/api/catalog", {"category": "Unused", "color": "Test", "unit": "qty"}, team, 201)
+    ok("POST", "/api/contacts", {"name": "Order Watcher", "email": "orders@test.local"}, team, 201)
+    order_contact = next(x for x in ok("GET", "/api/contacts", token=admin)[0] if x["email"] == "orders@test.local")
     assert call("POST", "/api/orders", {"s_number": "S99999", "brand": "Paint", "color": "Blue", "gallons": 1}, team)[0] == 400
     admin_data, _ = ok("GET", "/api/admin", token=admin)
     unused_id = next(x["id"] for x in admin_data["catalog"] if x["category"] == "Unused")
@@ -111,10 +114,12 @@ try:
     costing, _ = ok("GET", "/api/costing", token=admin)
     rate_id = costing["current_rates"][0]["id"]
 
-    multi_gal, _ = ok("POST", "/api/orders", {"s_number": "S10999", "brand": "Paint", "color": "Blue", "gallons": 2, "ship_month": "2027-04"}, team, 201)
+    multi_gal, _ = ok("POST", "/api/orders", {"s_number": "S10999", "po_number": "PO-TEST-10999", "brand": "Paint", "color": "Blue", "gallons": 2, "ship_month": "2027-04", "recipient_ids": [order_contact["id"]]}, team, 201)
+    assert multi_gal["po_number"] == "PO-TEST-10999" and "disabled" in multi_gal["email_status"].lower()
     multi_qty, _ = ok("POST", "/api/orders", {"s_number": "S10999", "brand": "Parts", "color": "Red", "gallons": 30, "ship_month": "2027-04"}, team, 201)
     multi_detail, _ = ok("GET", "/api/s-numbers/S10999/detail", token=admin)
     assert multi_detail["status"] == "Not Started" and len(multi_detail["orders"]) == 2
+    assert multi_detail["po_numbers"] == ["PO-TEST-10999"] and multi_detail["orders"][0]["po_number"] == "PO-TEST-10999"
     assert multi_detail["totals"]["ordered_gallons"] == 2 and multi_detail["totals"]["ordered_qty"] == 30
     assert {x["brand"] for x in multi_detail["orders"]} == {"Paint", "Parts"}
     ok("DELETE", f"/api/admin/orders/{multi_gal['id']}", token=admin)
@@ -336,9 +341,10 @@ try:
 
     admin_data, _ = ok("GET", "/api/admin", token=admin)
     stock_order_admin = next(x for x in admin_data["orders"] if x["s_number"] == "S10003")
-    ok("PUT", f"/api/admin/orders/{stock_order_admin['id']}", {"s_number": "S10003", "brand": "Paint", "color": "Blue", "gallons": 10, "ship_month": "2027-03", "created_at": stock_order_admin["created_at"]}, manager)
+    ok("PUT", f"/api/admin/orders/{stock_order_admin['id']}", {"s_number": "S10003", "po_number": "PO-EDIT-10003", "brand": "Paint", "color": "Blue", "gallons": 10, "ship_month": "2027-03", "created_at": stock_order_admin["created_at"]}, manager)
     admin_data, _ = ok("GET", "/api/admin", token=admin)
     assert next(x for x in admin_data["orders"] if x["id"] == stock_order_admin["id"])["ship_month"] == "2027-03"
+    assert next(x for x in admin_data["orders"] if x["id"] == stock_order_admin["id"])["po_number"] == "PO-EDIT-10003"
     assert call("DELETE", f"/api/admin/orders/{stock_order_admin['id']}", token=manager)[0] == 403
 
     for route in ("/", "/entry", "/production", "/inventory", "/shipping", "/costing", "/reporting", "/admin", "/tv"):
@@ -348,7 +354,7 @@ try:
     dashboard_page = call("GET", "/", token=admin)[1]
     assert b"Changes every 15 seconds" in tv_page and b"Orders by Ship Month" in tv_page
     assert b"Orders by Ship Month" in production_page and b'type="month"' in production_page
-    assert b"showOrderDetail" in dashboard_page and b"Packaging Requirements" in dashboard_page
+    assert b"PO# optional" in production_page and b"showOrderDetail" in dashboard_page and b"Packaging Requirements" in dashboard_page
     for route in ("/api/reports/category.csv", "/api/reports/labor.csv"):
         assert call("GET", route, token=admin)[0] == 200, route
     report, _ = ok("GET", "/api/reporting", token=admin)

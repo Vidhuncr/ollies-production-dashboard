@@ -247,6 +247,13 @@ def normalize_ship_month(value):
     return result
 
 
+def normalize_po_number(value):
+    result = re.sub(r"[\r\n\t]+", " ", str(value or "")).strip()
+    if len(result) > 80:
+        raise ValueError("PO# must be 80 characters or fewer.")
+    return result
+
+
 def next_no_s_reference_sql(con):
     values = []
     for row in con.execute("SELECT s_number FROM orders WHERE s_number LIKE 'N%'").fetchall():
@@ -513,6 +520,7 @@ SUPABASE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS orders (
   id BIGSERIAL PRIMARY KEY,
   s_number TEXT NOT NULL DEFAULT '',
+  po_number TEXT NOT NULL DEFAULT '',
   brand TEXT NOT NULL,
   color TEXT NOT NULL,
   unit TEXT NOT NULL DEFAULT 'gallons',
@@ -520,6 +528,7 @@ CREATE TABLE IF NOT EXISTS orders (
   ship_month TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL
 );
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS po_number TEXT NOT NULL DEFAULT '';
 CREATE TABLE IF NOT EXISTS production (
   id BIGSERIAL PRIMARY KEY,
   order_id BIGINT REFERENCES orders(id),
@@ -729,6 +738,7 @@ def initialize():
         CREATE TABLE IF NOT EXISTS orders (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           s_number TEXT NOT NULL DEFAULT '',
+          po_number TEXT NOT NULL DEFAULT '',
           brand TEXT NOT NULL,
           color TEXT NOT NULL,
           unit TEXT NOT NULL DEFAULT 'gallons',
@@ -946,6 +956,8 @@ def initialize():
             con.execute("ALTER TABLE orders ADD COLUMN unit TEXT NOT NULL DEFAULT 'gallons'")
         if "ship_month" not in order_columns:
             con.execute("ALTER TABLE orders ADD COLUMN ship_month TEXT NOT NULL DEFAULT ''")
+        if "po_number" not in order_columns:
+            con.execute("ALTER TABLE orders ADD COLUMN po_number TEXT NOT NULL DEFAULT ''")
         con.execute("CREATE INDEX IF NOT EXISTS idx_orders_ship_month ON orders(ship_month)")
         production_columns = {x[1] for x in con.execute("PRAGMA table_info(production)")}
         if "unit" not in production_columns:
@@ -1065,7 +1077,7 @@ def dashboard_data():
     current_month = today[:7]
     with closing(connect()) as con:
         orders = con.execute("""
-          SELECT o.id, o.s_number, o.brand, o.color, o.unit, o.gallons, o.ship_month, o.created_at,
+          SELECT o.id, o.s_number, o.po_number, o.brand, o.color, o.unit, o.gallons, o.ship_month, o.created_at,
                  ROUND(o.gallons - COALESCE(SUM(p.gallons),0),2) remaining
           FROM orders o LEFT JOIN production p ON p.order_id=o.id
           GROUP BY o.id HAVING o.gallons - COALESCE(SUM(p.gallons),0) > 0.0001
@@ -1102,13 +1114,13 @@ def dashboard_data():
             })
         for order in order_rows:
             order["recipients"] = recipients_by_order.get(order["id"], [])
-        requirement_orders = con.execute("""SELECT o.id,o.s_number,o.brand,o.color,o.gallons,o.unit,o.ship_month
+        requirement_orders = con.execute("""SELECT o.id,o.s_number,o.po_number,o.brand,o.color,o.gallons,o.unit,o.ship_month
           FROM orders o LEFT JOIN s_number_status s ON s.s_number=o.s_number
           WHERE s.shipped_at IS NULL ORDER BY o.s_number,o.brand,o.color,o.id""").fetchall()
-        active_orders = con.execute("""SELECT o.id,o.s_number,o.brand,o.color,o.gallons,o.unit,o.ship_month,o.created_at
+        active_orders = con.execute("""SELECT o.id,o.s_number,o.po_number,o.brand,o.color,o.gallons,o.unit,o.ship_month,o.created_at
           FROM orders o LEFT JOIN s_number_status s ON s.s_number=o.s_number
           WHERE s.shipped_at IS NULL ORDER BY o.s_number,o.brand,o.color,o.id""").fetchall()
-        schedule_raw = con.execute("""SELECT o.id,o.s_number,o.brand,o.color,o.unit,o.gallons,o.ship_month,o.created_at,
+        schedule_raw = con.execute("""SELECT o.id,o.s_number,o.po_number,o.brand,o.color,o.unit,o.gallons,o.ship_month,o.created_at,
           ROUND(COALESCE(SUM(p.gallons),0),2) produced,
           ROUND(CASE WHEN o.gallons-COALESCE(SUM(p.gallons),0)>0
                 THEN o.gallons-COALESCE(SUM(p.gallons),0) ELSE 0 END,2) remaining,
@@ -1189,11 +1201,18 @@ def dashboard_data():
           COALESCE(SUM((k.package_count-COALESCE((SELECT SUM(h.package_count) FROM shipments h WHERE h.packaging_id=k.id),0))*k.package_size),0) packaged_gallons
           FROM packaging k GROUP BY k.s_number""").fetchall()}
         s_numbers = []
+        po_numbers_by_s = {}
+        for row in con.execute("SELECT s_number,po_number FROM orders WHERE trim(po_number)<>'' ORDER BY id").fetchall():
+            values = po_numbers_by_s.setdefault(row["s_number"], [])
+            if row["po_number"] not in values:
+                values.append(row["po_number"])
         for status in statuses:
             remaining = remaining_by_s.get(status["s_number"], {})
             unpackaged = unpackaged_by_s.get(status["s_number"], {})
             packed = packed_by_s.get(status["s_number"])
-            s_numbers.append({**dict(status), "remaining_gallons": remaining.get("gallons",0),
+            po_numbers = po_numbers_by_s.get(status["s_number"], [])
+            s_numbers.append({**dict(status), "po_number": ", ".join(po_numbers), "po_numbers": po_numbers,
+                              "remaining_gallons": remaining.get("gallons",0),
                               "remaining_qty": remaining.get("qty",0), "unpackaged_gallons": unpackaged.get("gallons",0),
                               "unpackaged_qty": unpackaged.get("qty",0),
                               "package_count": int(packed["package_count"]) if packed else 0,
@@ -1221,7 +1240,7 @@ def s_number_detail(s_number):
     if not reference:
         return None
     with closing(connect()) as con:
-        orders = [dict(x) for x in con.execute("""SELECT o.id,o.s_number,o.brand,o.color,o.unit,o.gallons,
+        orders = [dict(x) for x in con.execute("""SELECT o.id,o.s_number,o.po_number,o.brand,o.color,o.unit,o.gallons,
           o.ship_month,o.created_at,
           ROUND(COALESCE((SELECT SUM(p.gallons) FROM production p WHERE p.order_id=o.id),0),2) produced,
           ROUND(COALESCE((SELECT SUM(k.gallons) FROM packaging k WHERE k.order_id=o.id),0),2) packaged,
@@ -1292,7 +1311,8 @@ def s_number_detail(s_number):
     has_production = totals["produced_gallons"] > .0001 or totals["produced_qty"] > .0001
     overall_status = "Shipped" if status.get("shipped_at") else "Ready" if status.get("ready_at") else (
       ("In Production" if has_production else "Not Started") if has_remaining else "Packaging")
-    return {"s_number": reference, "status": overall_status, "status_history": status,
+    return {"s_number": reference, "po_numbers": sorted({x["po_number"] for x in orders if x["po_number"]}),
+      "status": overall_status, "status_history": status,
       "ship_months": sorted({x["ship_month"] for x in orders if x["ship_month"]}), "totals": totals,
       "orders": orders, "batches": batches, "requirements": requirements, "packages": packages,
       "recipients": recipients, "labor": {"hours": float(labor["hours"]), "cost": float(labor["cost"])} if labor else {"hours": 0, "cost": 0}}
@@ -1312,7 +1332,7 @@ def cached_dashboard_data():
 def admin_data():
     with closing(connect()) as con:
         orders = con.execute("""
-          SELECT o.id,o.s_number,o.brand,o.color,o.unit,o.gallons,o.ship_month,o.created_at,
+          SELECT o.id,o.s_number,o.po_number,o.brand,o.color,o.unit,o.gallons,o.ship_month,o.created_at,
                  ROUND(COALESCE(SUM(p.gallons),0),2) produced,
                  ROUND(o.gallons-COALESCE(SUM(p.gallons),0),2) remaining
           FROM orders o LEFT JOIN production p ON p.order_id=o.id
@@ -1360,15 +1380,15 @@ def user_data():
         return [dict(x) for x in con.execute("SELECT id,username,email,display_name,role,active,created_at FROM users ORDER BY active DESC,display_name,email,username").fetchall()]
 
 
-def deliver_notification_email(recipient_emails, subject, body):
+def deliver_notification_email(recipient_emails, subject, body, saved_label="Production saved"):
     recipients = [str(email or "").strip() for email in recipient_emails if valid_email(email)]
     if not recipients:
         return None
     if not EMAIL_ENABLED:
-        return "Production saved; email notifications are disabled for this environment."
+        return f"{saved_label}; email notifications are disabled for this environment."
     if EMAIL_PROVIDER == "google_apps_script":
         if not GOOGLE_APPS_SCRIPT_URL.startswith("https://script.google.com/") or not GOOGLE_APPS_SCRIPT_SECRET:
-            return "Production saved, but Google Apps Script email is not configured."
+            return f"{saved_label}, but Google Apps Script email is not configured."
         try:
             request = Request(
                 GOOGLE_APPS_SCRIPT_URL,
@@ -1387,13 +1407,13 @@ def deliver_notification_email(recipient_emails, subject, body):
                 raise RuntimeError(str(result.get("error") or "Apps Script rejected the request"))
             return f"Email sent to {len(recipients)} recipient(s)."
         except HTTPError as exc:
-            return f"Production saved, but Google Apps Script email failed with HTTP {exc.code}."
+            return f"{saved_label}, but Google Apps Script email failed with HTTP {exc.code}."
         except (URLError, TimeoutError, OSError) as exc:
-            return f"Production saved, but Google Apps Script email failed: {exc}."
+            return f"{saved_label}, but Google Apps Script email failed: {exc}."
         except (ValueError, RuntimeError) as exc:
-            return f"Production saved, but Google Apps Script email failed: {exc}."
+            return f"{saved_label}, but Google Apps Script email failed: {exc}."
     if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD:
-        return "Production saved, but Gmail is not configured."
+        return f"{saved_label}, but Gmail is not configured."
     message = EmailMessage(); message["From"] = GMAIL_ADDRESS
     message["To"] = ", ".join(recipients); message["Subject"] = subject; message.set_content(body)
     try:
@@ -1401,19 +1421,36 @@ def deliver_notification_email(recipient_emails, subject, body):
             smtp.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD); smtp.send_message(message)
         return f"Email sent to {len(recipients)} recipient(s)."
     except Exception as exc:
-        return f"Production saved, but email failed: {exc}"
+        return f"{saved_label}, but email failed: {exc}"
+
+
+def send_order_created_email(order_id):
+    with closing(connect()) as con:
+        order = con.execute("""SELECT s_number,po_number,brand,color,unit,gallons,ship_month,created_at
+          FROM orders WHERE id=?""", (order_id,)).fetchone()
+        recipients = con.execute("""SELECT c.email FROM contacts c JOIN order_recipients r ON r.contact_id=c.id
+          WHERE r.order_id=? AND c.active=1 ORDER BY c.email""", (order_id,)).fetchall()
+    if not order or not recipients:
+        return None
+    unit = "qty" if order["unit"] == "qty" else "gallons"
+    po_text = order["po_number"] or "Not provided"
+    subject = f"New order {order['s_number']}" + (f" — PO {order['po_number']}" if order["po_number"] else "")
+    body = (f"A new production order was added.\n\nS#/Order: {order['s_number']}\nPO#: {po_text}\n"
+            f"Category: {order['brand']}\nColor: {order['color']}\nRequired: {float(order['gallons']):g} {unit}\n"
+            f"Ship month: {order['ship_month']}\nOrder entered: {order['created_at']}\n")
+    return deliver_notification_email([x["email"] for x in recipients], subject, body, "Order saved")
 
 
 def send_production_email(order_id, batch_number, produced_amount, remaining):
     with closing(connect()) as con:
-        order = con.execute("SELECT s_number,brand,color,unit FROM orders WHERE id=?", (order_id,)).fetchone()
+        order = con.execute("SELECT s_number,po_number,brand,color,unit FROM orders WHERE id=?", (order_id,)).fetchone()
         recipients = con.execute("""SELECT c.email FROM contacts c JOIN order_recipients r ON r.contact_id=c.id
           WHERE r.order_id=? AND c.active=1 ORDER BY c.email""", (order_id,)).fetchall()
     if not order or not recipients: return None
     unit = "qty" if order["unit"] == "qty" else "gallons"; complete = remaining <= .0001
     subject = f"{order['s_number']} - {'Production complete' if complete else 'Partial production update'}"
     status = "COMPLETE" if complete else "PARTIALLY PRODUCED"
-    body = (f"S#: {order['s_number']}\nCategory: {order['brand']}\nColor: {order['color']}\n"
+    body = (f"S#: {order['s_number']}\nPO#: {order['po_number'] or 'Not provided'}\nCategory: {order['brand']}\nColor: {order['color']}\n"
             f"Batch #: {batch_number}\nStatus: {status}\nProduced this batch: {produced_amount:g} {unit}\n"
             f"Need to produce: {max(remaining,0):g} {unit}\n")
     return deliver_notification_email([x["email"] for x in recipients], subject, body)
@@ -1458,7 +1495,7 @@ def category_report_csv():
 def costing_data():
     today = date.today().isoformat()
     with closing(connect()) as con:
-        orders = [dict(x) for x in con.execute("SELECT id,s_number,brand,color,unit,gallons,created_at FROM orders ORDER BY s_number,brand,color,id").fetchall()]
+        orders = [dict(x) for x in con.execute("SELECT id,s_number,po_number,brand,color,unit,gallons,created_at FROM orders ORDER BY s_number,brand,color,id").fetchall()]
         rates = [dict(x) for x in con.execute("SELECT * FROM labor_rates ORDER BY labor_name,effective_from DESC,id DESC").fetchall()]
         current_rates = []
         for rate in rates:
@@ -1497,7 +1534,7 @@ def costing_data():
 def reporting_data():
     generated_at = datetime.now().isoformat(timespec="seconds")
     with closing(connect()) as con:
-        order_rows = [dict(x) for x in con.execute("""SELECT o.id order_id,o.s_number,o.brand,o.color,o.unit,o.created_at,
+        order_rows = [dict(x) for x in con.execute("""SELECT o.id order_id,o.s_number,o.po_number,o.brand,o.color,o.unit,o.created_at,
           ROUND(o.gallons,2) required_amount,
           ROUND(COALESCE((SELECT SUM(p.gallons) FROM production p WHERE p.order_id=o.id),0),2) produced_amount,
           ROUND(CASE WHEN o.gallons-COALESCE((SELECT SUM(p.gallons) FROM production p WHERE p.order_id=o.id),0)>0
@@ -1517,7 +1554,7 @@ def reporting_data():
           s.done_at,s.ready_at,s.shipped_at,
           (SELECT MAX(h.shipped_at) FROM shipments h JOIN packaging k ON k.id=h.packaging_id WHERE k.order_id=o.id) last_shipped_at
           FROM orders o LEFT JOIN s_number_status s ON s.s_number=o.s_number ORDER BY o.s_number,o.brand,o.color,o.id""").fetchall()]
-        package_rows = [dict(x) for x in con.execute("""SELECT r.id,r.order_id,r.s_number,r.brand,r.color,o.unit,o.created_at,
+        package_rows = [dict(x) for x in con.execute("""SELECT r.id,r.order_id,r.s_number,o.po_number,r.brand,r.color,o.unit,o.created_at,
           r.package_type,r.package_size,r.required_count,
           COALESCE((SELECT SUM(k.package_count) FROM packaging k WHERE k.order_id=r.order_id AND k.package_type=r.package_type),0) packaged_count,
           COALESCE((SELECT SUM(h.package_count) FROM shipments h JOIN packaging k ON k.id=h.packaging_id
@@ -2088,6 +2125,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"ok":True,"id":cur.lastrowid},201)
             if path == "/api/orders":
                 s_number = normalize_order_reference(payload.get("s_number"))
+                po_number = normalize_po_number(payload.get("po_number"))
                 brand = str(payload.get("brand", "")).strip()
                 color = str(payload.get("color", "")).strip()
                 gallons = float(payload.get("gallons", 0)); ship_month = normalize_ship_month(payload.get("ship_month"))
@@ -2102,8 +2140,8 @@ class Handler(BaseHTTPRequestHandler):
                     if closed and (closed["done_at"] or closed["shipped_at"]): raise ValueError("This order is already ready or shipped and cannot receive another line.")
                     item = con.execute("SELECT unit FROM catalog WHERE category=? AND color=?", (brand,color)).fetchone()
                     if not item: raise ValueError("Select a color from the chosen category.")
-                    cur = con.execute("INSERT INTO orders(s_number,brand,color,unit,gallons,ship_month,created_at) VALUES(?,?,?,?,?,?,?)",
-                                (s_number, brand, color, item["unit"], gallons, ship_month, datetime.now().isoformat(timespec="seconds")))
+                    cur = con.execute("INSERT INTO orders(s_number,po_number,brand,color,unit,gallons,ship_month,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                                (s_number, po_number, brand, color, item["unit"], gallons, ship_month, datetime.now().isoformat(timespec="seconds")))
                     order_id = cur.lastrowid
                     recipient_ids = payload.get("recipient_ids", [])
                     if not isinstance(recipient_ids, list): raise ValueError("Email recipients are invalid.")
@@ -2111,7 +2149,9 @@ class Handler(BaseHTTPRequestHandler):
                         active = con.execute("SELECT 1 FROM contacts WHERE id=? AND active=1", (contact_id,)).fetchone()
                         if active: con.execute("INSERT INTO order_recipients(order_id,contact_id) VALUES(?,?)", (order_id,contact_id))
                     con.commit()
-                return self.send_json({"ok": True,"id":order_id,"s_number":s_number,"has_s_number":s_number.startswith("S")}, 201)
+                email_status = send_order_created_email(order_id)
+                return self.send_json({"ok": True,"id":order_id,"s_number":s_number,"po_number":po_number,
+                  "has_s_number":s_number.startswith("S"),"email_status":email_status}, 201)
             if path == "/api/contacts":
                 name = str(payload.get("name", "")).strip(); email = str(payload.get("email", "")).strip().lower()
                 if not name or not valid_email(email): raise ValueError("Enter a name and valid email address.")
@@ -2411,6 +2451,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"ok": True})
             if kind == "orders":
                 brand = str(payload.get("brand", "")).strip(); color = str(payload.get("color", "")).strip()
+                po_number = normalize_po_number(payload.get("po_number"))
                 gallons = float(payload.get("gallons", 0)); created_at = str(payload.get("created_at", "")).strip(); ship_month = normalize_ship_month(payload.get("ship_month"))
                 if not brand or not color or gallons <= 0 or not created_at: raise ValueError("Complete every order field.")
                 with closing(connect()) as con:
@@ -2425,7 +2466,7 @@ class Handler(BaseHTTPRequestHandler):
                     unit = catalog_item["unit"]
                     row = con.execute("SELECT COALESCE(SUM(gallons),0) produced FROM production WHERE order_id=?", (record_id,)).fetchone()
                     if gallons + .0001 < row["produced"]: raise ValueError(f"Order cannot be below {row['produced']:.2f} gallons already produced.")
-                    cur = con.execute("UPDATE orders SET s_number=?,brand=?,color=?,unit=?,gallons=?,ship_month=?,created_at=? WHERE id=?", (s_number,brand,color,unit,gallons,ship_month,created_at,record_id))
+                    cur = con.execute("UPDATE orders SET s_number=?,po_number=?,brand=?,color=?,unit=?,gallons=?,ship_month=?,created_at=? WHERE id=?", (s_number,po_number,brand,color,unit,gallons,ship_month,created_at,record_id))
                     if not cur.rowcount: raise ValueError("Order was not found.")
                     con.execute("UPDATE production SET brand=?,color=?,unit=? WHERE order_id=?", (brand,color,unit,record_id))
                     con.execute("UPDATE packaging SET s_number=?,brand=?,color=? WHERE order_id=?", (s_number,brand,color,record_id))
