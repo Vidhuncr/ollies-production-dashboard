@@ -23,7 +23,7 @@
     <div id="scheduleFoot" class="panelTitle"></div>
   </section></main>
   <div class="motivation">QUALITY • TEAMWORK • PROGRESS</div><div id="rotationFoot" class="screenFoot">Screen 1 of 2 • Changes every 15 seconds</div>
-  <script>
+  <script src="/app-runtime.js"></script><script>
     const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const fmt=n=>Number(n||0).toLocaleString(undefined,{maximumFractionDigits:1});
     const orderRef=s=>String(s||'').startsWith('N')?`No S# • ${s}`:s;

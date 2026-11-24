@@ -37,7 +37,7 @@
     <section id="customSheet" class="reportSheet section"><div class="reportTitle"><div><span class="eyebrow">OLLIES PRODUCTION</span><h2 id="reportHeading">Category Summary</h2><p id="reportSubheading"></p></div><div class="reportStamp" id="reportStamp"></div></div><div id="comparison" class="comparison"></div><div class="scroll reportTable"><table><thead id="reportHead"></thead><tbody id="reportRows"></tbody><tfoot id="reportFoot"></tfoot></table></div></section>
   </section>
 </main><div id="toast"></div>
-<script>
+<script src="/app-runtime.js"></script><script>
 let data={},currentRows=[],currentColumns=[];
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmt=n=>Number(n||0).toLocaleString(undefined,{maximumFractionDigits:2});

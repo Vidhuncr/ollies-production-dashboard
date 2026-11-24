@@ -19,10 +19,14 @@ if defined USE_SUPABASE (
   "%PLANT_PYTHON%" -c "import psycopg" >nul 2>nul
   if errorlevel 1 "%PLANT_PYTHON%" -m pip install -r requirements.txt
 )
+:run_dashboard
 "%PLANT_PYTHON%" -u app.py
 if errorlevel 1 (
   echo.
-  echo Dashboard stopped with an error. Read the message above or send a screenshot.
+  echo Dashboard stopped unexpectedly. Your saved database is safe.
+  echo Restarting automatically in 5 seconds. Press Ctrl+C to stop.
+  timeout /t 5 /nobreak >nul
+  goto run_dashboard
 )
 :end
 pause

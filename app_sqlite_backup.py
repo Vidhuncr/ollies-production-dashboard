@@ -1,5 +1,6 @@
 import csv
 import base64
+import gzip
 import hashlib
 import hmac
 import io
@@ -10,8 +11,10 @@ import secrets
 import socket
 import sqlite3
 import smtplib
+import sys
 import threading
 import time
+import traceback
 import webbrowser
 from contextlib import closing
 from datetime import date, datetime, timedelta
@@ -83,6 +86,12 @@ SESSION_LOCK = threading.RLock()
 DASHBOARD_CACHE_LOCK = threading.RLock()
 DASHBOARD_CACHE = {"expires": 0.0, "value": None}
 DASHBOARD_CACHE_TTL = bounded_env_number("DASHBOARD_CACHE_TTL", 1.5, 0.25, 10, as_float=True)
+READ_CACHE_LOCK = threading.RLock()
+READ_CACHE = {}
+READ_CACHE_TTL = bounded_env_number("READ_CACHE_TTL", 3, 0.5, 30, as_float=True)
+STATIC_CACHE_LOCK = threading.RLock()
+STATIC_CACHE = {}
+PROCESS_STARTED_AT = time.monotonic()
 MAX_REQUEST_BYTES = bounded_env_number("MAX_REQUEST_BYTES", 1048576, 4096, 5 * 1024 * 1024)
 DatabaseIntegrityError = (sqlite3.IntegrityError, PsycopgIntegrityError)
 DatabaseOperationalError = (sqlite3.OperationalError, PsycopgError, RuntimeError)
@@ -215,7 +224,43 @@ def invalidate_session_user(user_id):
 def invalidate_dashboard_cache():
     with DASHBOARD_CACHE_LOCK:
         DASHBOARD_CACHE["expires"] = 0.0
-        DASHBOARD_CACHE["value"] = None
+        # Keep the prior value as a short-lived emergency fallback if Supabase
+        # has a transient interruption while the next refresh is attempted.
+    with READ_CACHE_LOCK:
+        READ_CACHE.clear()
+
+
+def cached_read(key, loader, ttl=None):
+    """Cache expensive read-only payloads briefly without caching writes."""
+    now = time.monotonic()
+    with READ_CACHE_LOCK:
+        cached = READ_CACHE.get(key)
+        if cached and cached[0] > now:
+            return cached[1]
+    value = loader()
+    with READ_CACHE_LOCK:
+        if len(READ_CACHE) >= 128:
+            expired = [name for name, item in READ_CACHE.items() if item[0] <= now]
+            for name in expired:
+                READ_CACHE.pop(name, None)
+            if len(READ_CACHE) >= 128:
+                READ_CACHE.pop(next(iter(READ_CACHE)), None)
+        READ_CACHE[key] = (time.monotonic() + (ttl or READ_CACHE_TTL), value)
+    return value
+
+
+def cached_static_file(filename):
+    path = ROOT / filename
+    stamp = path.stat().st_mtime_ns
+    with STATIC_CACHE_LOCK:
+        cached = STATIC_CACHE.get(filename)
+        if cached and cached[0] == stamp:
+            return cached[1], cached[2]
+    data = path.read_bytes()
+    etag = 'W/"' + hashlib.sha256(data).hexdigest()[:20] + '"'
+    with STATIC_CACHE_LOCK:
+        STATIC_CACHE[filename] = (stamp, data, etag)
+    return data, etag
 
 
 def valid_email(value):
@@ -341,12 +386,33 @@ class PostgresCursor:
         return iter(self.fetchall())
 
 
+def new_postgres_connection(database_url):
+    """Create a resilient pooled connection with bounded database waits."""
+    if psycopg is None:
+        raise RuntimeError("PostgreSQL support is not installed. Run: python -m pip install -r requirements.txt")
+    connection = psycopg.connect(
+        database_url,
+        connect_timeout=10,
+        prepare_threshold=None,
+        application_name="ollies-production-dashboard",
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=3,
+    )
+    connection.execute("SET statement_timeout TO '25s'")
+    connection.execute("SET lock_timeout TO '8s'")
+    connection.execute("SET idle_in_transaction_session_timeout TO '30s'")
+    connection.commit()
+    return connection
+
+
 class PostgresConnection:
     def __init__(self, database_url=None, connection=None, pool=None):
         if psycopg is None:
             raise RuntimeError("PostgreSQL support is not installed. Run: python -m pip install -r requirements.txt")
         self._pool = pool
-        self._connection = connection or psycopg.connect(database_url, connect_timeout=10, prepare_threshold=None)
+        self._connection = connection or new_postgres_connection(database_url)
 
     def execute(self, sql, params=()):
         statement = postgres_sql(sql).strip()
@@ -396,10 +462,22 @@ class PostgresPool:
 
     def _create(self):
         try:
-            return psycopg.connect(self.database_url, connect_timeout=10, prepare_threshold=None)
+            return new_postgres_connection(self.database_url)
         except Exception:
             self._decrement()
             raise
+
+    def _validate(self, connection):
+        try:
+            connection.execute("SELECT 1")
+            connection.rollback()
+            return True
+        except Exception:
+            try:
+                connection.close()
+            finally:
+                self._decrement()
+            return False
 
     def get(self):
         while True:
@@ -411,7 +489,9 @@ class PostgresPool:
                     finally:
                         self._decrement()
                     continue
-                return connection
+                if self._validate(connection):
+                    return connection
+                continue
             except Empty:
                 with self.lock:
                     create_new = self.total < self.max_size
@@ -429,7 +509,8 @@ class PostgresPool:
                     finally:
                         self._decrement()
                     continue
-                return connection
+                if self._validate(connection):
+                    return connection
 
     def put(self, connection):
         try:
@@ -475,7 +556,9 @@ def connect():
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys=ON")
     con.execute("PRAGMA busy_timeout=30000")
-    con.execute("PRAGMA synchronous=NORMAL")
+    con.execute("PRAGMA synchronous=FULL")
+    con.execute("PRAGMA wal_autocheckpoint=1000")
+    con.execute("PRAGMA journal_size_limit=67108864")
     return con
 
 
@@ -1396,7 +1479,13 @@ def cached_dashboard_data():
     with DASHBOARD_CACHE_LOCK:
         if DASHBOARD_CACHE["value"] is not None and DASHBOARD_CACHE["expires"] > now:
             return DASHBOARD_CACHE["value"]
-        value = dashboard_data()
+        stale = DASHBOARD_CACHE["value"]
+        try:
+            value = dashboard_data()
+        except DatabaseOperationalError:
+            if stale is not None:
+                return stale
+            raise
         DASHBOARD_CACHE["value"] = value
         DASHBOARD_CACHE["expires"] = time.monotonic() + DASHBOARD_CACHE_TTL
         return value
@@ -1763,15 +1852,40 @@ class Handler(BaseHTTPRequestHandler):
         super().setup()
         self.connection.settimeout(30)
 
+    def _send_bytes(self, data, status=200, content_type="application/octet-stream", cache_control="no-store", extra_headers=None):
+        payload = data
+        compressed = False
+        if len(data) >= 1024 and "gzip" in self.headers.get("Accept-Encoding", "").lower():
+            payload = gzip.compress(data, compresslevel=5)
+            compressed = True
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", cache_control)
+        if compressed:
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Vary", "Accept-Encoding")
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        try:
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _internal_error(self, exc):
+        print(f"Unhandled request error: {self.command} {self.path}: {exc}", file=sys.stderr, flush=True)
+        traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
+        try:
+            return self.send_json({"error": "The service had a temporary problem. Please try again."}, 500)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return None
+
     def send_json(self, obj, status=200):
         if status < 400 and self.command in ("POST", "PUT", "DELETE"):
             invalidate_dashboard_cache()
-        data = json.dumps(obj).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers(); self.wfile.write(data)
+        data = json.dumps(obj, separators=(",", ":")).encode()
+        return self._send_bytes(data, status, "application/json; charset=utf-8")
 
     def body(self):
         size = int(self.headers.get("Content-Length", 0))
@@ -1780,20 +1894,31 @@ class Handler(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(size) or b"{}")
 
     def send_csv(self, data, filename):
-        self.send_response(200); self.send_header("Content-Type", "text/csv; charset=utf-8")
-        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+        return self._send_bytes(data, 200, "text/csv; charset=utf-8", "no-store", {
+            "Content-Disposition": f'attachment; filename="{filename}"'
+        })
 
     def send_file(self, filename):
-        data = (ROOT / filename).read_bytes(); self.send_response(200)
-        content_type = "text/css; charset=utf-8" if filename.endswith(".css") else "text/html; charset=utf-8"
-        self.send_header("Content-Type", content_type); self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers(); self.wfile.write(data)
+        data, etag = cached_static_file(filename)
+        is_asset = filename.endswith((".css", ".js"))
+        cache_control = "public, max-age=300, must-revalidate" if is_asset else "no-cache"
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            self.send_header("Cache-Control", cache_control)
+            self.send_header("ETag", etag)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        content_type = (
+            "text/css; charset=utf-8" if filename.endswith(".css")
+            else "application/javascript; charset=utf-8" if filename.endswith(".js")
+            else "text/html; charset=utf-8"
+        )
+        return self._send_bytes(data, 200, content_type, cache_control, {"ETag": etag})
 
     def send_redirect(self, location):
-        self.send_response(302); self.send_header("Location", location); self.end_headers()
+        self.send_response(302); self.send_header("Location", location)
+        self.send_header("Content-Length", "0"); self.end_headers()
 
     def session_cookie(self, token="", max_age=0):
         secure = "; Secure" if (
@@ -1842,10 +1967,18 @@ class Handler(BaseHTTPRequestHandler):
             return self._do_GET()
         except DatabaseOperationalError:
             return self.send_json({"error": "The database is busy. Please try again in a moment."}, 503)
+        except Exception as exc:
+            return self._internal_error(exc)
 
     def _do_GET(self):
         path = urlparse(self.path).path
         if path == "/health":
+            return self.send_json({
+                "ok": True,
+                "uptime_seconds": int(time.monotonic() - PROCESS_STARTED_AT),
+                "database": "supabase" if USE_SUPABASE else "sqlite",
+            })
+        if path == "/ready":
             try:
                 with closing(connect()) as con:
                     con.execute("SELECT 1").fetchone()
@@ -1859,6 +1992,7 @@ class Handler(BaseHTTPRequestHandler):
             detail = s_number_detail(unquote(detail_match.group(1)))
             return self.send_json(detail, 200) if detail else self.send_json({"error": "Order / S# was not found."}, 404)
         if path == "/app.css": return self.send_file("app.css")
+        if path == "/app-runtime.js": return self.send_file("app-runtime.js")
         if path in ("/login", "/login.html"): return self.send_file("login.html")
         if path == "/logout":
             clear_session(self.session_token())
@@ -1873,12 +2007,17 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_csv(category_report_csv(), f"ollies-category-production-{date.today().isoformat()}.csv")
         if path == "/api/costing":
             if not self.authorized(): return
-            return self.send_json(costing_data())
+            return self.send_json(cached_read("costing", costing_data))
         if path == "/api/reporting":
             if not self.authorized(): return
             query = parse_qs(urlparse(self.path).query)
             try:
-                return self.send_json(reporting_data(query.get("from", [""])[0], query.get("to", [""])[0]))
+                date_from = query.get("from", [""])[0]
+                date_to = query.get("to", [""])[0]
+                return self.send_json(cached_read(
+                    ("reporting", date_from, date_to),
+                    lambda: reporting_data(date_from, date_to),
+                ))
             except ValueError as exc:
                 return self.send_json({"error": str(exc)}, 400)
         if path == "/api/reports/labor.csv":
@@ -1886,10 +2025,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_csv(labor_report_csv(), f"ollies-labor-cost-{date.today().isoformat()}.csv")
         if path == "/api/catalog":
             if not self.authorized(): return
-            return self.send_json(catalog_data())
+            return self.send_json(cached_read("catalog", catalog_data, 10))
         if path == "/api/contacts":
             if not self.authorized(): return
-            return self.send_json(contact_data())
+            return self.send_json(cached_read("contacts", contact_data, 5))
         if path == "/api/admin":
             if not self.authorized(): return
             result = admin_data(); user = self.current_user(); result["current_user"] = user
@@ -1928,6 +2067,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._do_POST()
         except DatabaseOperationalError:
             return self.send_json({"error": "The database is busy. Please try again in a moment."}, 503)
+        except Exception as exc:
+            return self._internal_error(exc)
 
     def _do_POST(self):
         try:
@@ -2419,6 +2560,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._do_PUT()
         except DatabaseOperationalError:
             return self.send_json({"error": "The database is busy. Please try again in a moment."}, 503)
+        except Exception as exc:
+            return self._internal_error(exc)
 
     def _do_PUT(self):
         try:
@@ -2652,6 +2795,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"error": "This record is connected to other data. Delete the related records first."}, 400)
         except DatabaseOperationalError:
             return self.send_json({"error": "The database is busy. Please try again in a moment."}, 503)
+        except Exception as exc:
+            return self._internal_error(exc)
 
     def _do_DELETE(self):
         if not self.require_role("delete"): return
@@ -2769,9 +2914,33 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
         finally:
             self.request_slots.release()
 
+    def handle_error(self, request, client_address):
+        print(f"Request worker recovered after an error from {client_address[0]}.", file=sys.stderr, flush=True)
+        traceback.print_exc(file=sys.stderr)
+
+
+def initialize_with_retry():
+    """Wait through short Supabase wakeups/outages before letting Render restart us."""
+    attempts = bounded_env_number("STARTUP_DB_RETRIES", 6, 1, 12)
+    delay = 1.0
+    for attempt in range(1, attempts + 1):
+        try:
+            initialize()
+            return
+        except DatabaseOperationalError as exc:
+            if attempt >= attempts:
+                raise
+            print(
+                f"Database startup attempt {attempt}/{attempts} failed; retrying in {delay:.0f}s: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(delay)
+            delay = min(delay * 2, 15)
+
 
 def main():
-    initialize()
+    initialize_with_retry()
     port = int(os.environ.get("PORT", "8765"))
     is_render = os.environ.get("RENDER", "").lower() == "true"
     if is_render and not USE_SUPABASE:

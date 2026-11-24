@@ -126,7 +126,7 @@
 </main>
 
 <div id="entryMessage" role="status" aria-live="polite"></div>
-<script>
+<script src="/app-runtime.js"></script><script>
 let dashboard={},catalog=[],contacts=[],costing={},session={},activePanel='',orderModeValue='s',productionModeValue='s',feedModeValue='order';
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmt=n=>Number(n||0).toLocaleString(undefined,{maximumFractionDigits:2});

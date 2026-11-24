@@ -24,7 +24,11 @@ services:
       - key: MAX_REQUEST_THREADS
         value: "32"
       - key: DASHBOARD_CACHE_TTL
-        value: "1.5"
+        value: "3"
+      - key: READ_CACHE_TTL
+        value: "3"
+      - key: STARTUP_DB_RETRIES
+        value: "6"
       - key: EMAIL_ENABLED
         value: "false"
       - key: EMAIL_PROVIDER
