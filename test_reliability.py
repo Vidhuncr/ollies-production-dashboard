@@ -40,7 +40,8 @@ try:
 
     status, runtime, headers = call("/app-runtime.js")
     assert status == 200
-    assert b"resilientFetch" in runtime and b"attempts = retryable ? 3 : 1" in runtime
+    assert b"resilientFetch" in runtime and b"attempts = retryable ? 6 : 1" in runtime
+    assert b"scheduleInitialRecovery" in runtime and b"location.reload()" in runtime
     assert "max-age=300" in headers["Cache-Control"]
     etag = headers["ETag"]
     status, raw, headers = call("/app-runtime.js", {"If-None-Match": etag})

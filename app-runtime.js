@@ -5,8 +5,11 @@
   const transientStatuses = new Set([408, 429, 502, 503, 504]);
   const wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
   let banner;
+  let bannerTimer;
+  const recoveryReloads = new Map();
 
-  function recoveryBanner(message, error = false) {
+  function recoveryBanner(message, error = false, hideAfter = 0) {
+    clearTimeout(bannerTimer);
     if (!banner) {
       banner = document.createElement('div');
       banner.setAttribute('role', 'status');
@@ -22,20 +25,49 @@
     banner.textContent = message || '';
     banner.style.background = error ? '#b42318' : '#176b52';
     banner.style.display = message ? 'block' : 'none';
+    if (message && hideAfter) bannerTimer = setTimeout(() => recoveryBanner(''), hideAfter);
+  }
+
+  function clearScheduledRecovery(url) {
+    const timer = recoveryReloads.get(url);
+    if (timer) clearTimeout(timer);
+    recoveryReloads.delete(url);
+    try { sessionStorage.removeItem(`ollies-recovery:${url}`); } catch (_) {}
+  }
+
+  function scheduleInitialRecovery(url) {
+    if (performance.now() > 60000 || document.visibilityState === 'hidden' || recoveryReloads.has(url)) return;
+    const key = `ollies-recovery:${url}`;
+    let previous = 0;
+    try { previous = Number(sessionStorage.getItem(key) || 0); } catch (_) {}
+    if (previous >= 1) {
+      recoveryBanner('The service is temporarily unavailable. Your saved data is safe; refresh once to try again.', true, 12000);
+      return;
+    }
+    try { sessionStorage.setItem(key, '1'); } catch (_) {}
+    recoveryBanner('The service is still starting. This page will refresh automatically…');
+    recoveryReloads.set(url, setTimeout(() => location.reload(), 5000));
   }
 
   window.fetch = async function resilientFetch(input, init = {}) {
     const method = String(init.method || (input && input.method) || 'GET').toUpperCase();
     const url = typeof input === 'string' ? input : String(input && input.url || '');
     const retryable = (method === 'GET' || method === 'HEAD') && (url.startsWith('/') || url.startsWith(location.origin));
-    const attempts = retryable ? 3 : 1;
+    const attempts = retryable ? 6 : 1;
     let lastError;
 
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       try {
         const response = await originalFetch(input, init);
-        if (!retryable || !transientStatuses.has(response.status) || attempt === attempts - 1) {
-          if (response.ok) recoveryBanner('');
+        if (!retryable || !transientStatuses.has(response.status)) {
+          if (response.ok) {
+            clearScheduledRecovery(url);
+            recoveryBanner('');
+          }
+          return response;
+        }
+        if (attempt === attempts - 1) {
+          scheduleInitialRecovery(url);
           return response;
         }
         recoveryBanner('Connection interrupted. Reconnecting automatically…');
@@ -44,10 +76,10 @@
         if (!retryable || attempt === attempts - 1) break;
         recoveryBanner('Connection interrupted. Reconnecting automatically…');
       }
-      await wait(400 * (2 ** attempt) + Math.floor(Math.random() * 150));
+      await wait(Math.min(400 * (2 ** attempt), 3200) + Math.floor(Math.random() * 150));
     }
 
-    recoveryBanner('The connection is still unavailable. Your saved data is safe; please try again.', true);
+    scheduleInitialRecovery(url);
     throw lastError || new TypeError('The service is temporarily unavailable. Please try again.');
   };
 
