@@ -357,6 +357,21 @@ try:
     performance_targets = {x["key"]: x["target"] for x in dashboard["performance"]["periods"]}
     assert performance_targets["today"]["gallons"] == 4 and performance_targets["week"]["gallons"] == 28
     assert performance_targets["month"]["qty"] == 180 and performance_targets["lifetime"]["gallons"] == 0
+    target_day = app.date.today().isoformat()
+    assert call("POST", "/api/daily-targets", {"target_date": target_day, "scope": "combined", "unit": "gallons", "amount": 10}, team)[0] == 403
+    ok("POST", "/api/daily-targets", {"target_date": target_day, "scope": "combined", "unit": "gallons", "amount": 10}, manager)
+    ok("POST", "/api/daily-targets", {"target_date": target_day, "scope": "product", "brand": "Paint", "color": "Red", "amount": 3}, manager)
+    ok("POST", "/api/daily-targets", {"target_date": target_day, "scope": "product", "brand": "Parts", "color": "Red", "amount": 20}, admin)
+    dashboard, _ = ok("GET", "/api/dashboard")
+    today_period = next(x for x in dashboard["performance"]["periods"] if x["key"] == "today")
+    assert today_period["target"]["gallons"] == 10 and today_period["target"]["qty"] == 20
+    assert any(not x["brand"] and x["unit"] == "gallons" and x["amount"] == 10 for x in dashboard["performance"]["target_breakdown"])
+    assert any(x["brand"] == "Parts" and x["unit"] == "qty" and x["amount"] == 20 for x in dashboard["performance"]["target_breakdown"])
+    tv_fast, _ = ok("GET", "/api/tv-dashboard")
+    summary_fast, _ = ok("GET", "/api/dashboard-summary", token=admin)
+    assert set(tv_fast) == {"performance", "order_schedule"}
+    assert "active_inventory_packages" in summary_fast and "inventory" not in summary_fast
+    assert call("GET", "/api/dashboard-summary")[0] == 401
 
     for route in ("/", "/entry", "/production", "/inventory", "/shipping", "/costing", "/reporting", "/admin", "/tv"):
         assert call("GET", route, token=admin)[0] == 200, route
@@ -365,11 +380,11 @@ try:
     dashboard_page = call("GET", "/", token=admin)[1]
     reporting_page = call("GET", "/reporting", token=admin)[1]
     assert b"Changes every 15 seconds" in tv_page and b"14-Day Production Trend" in tv_page
-    assert b"DAILY TARGET CRUSHED" in tv_page and b"targetState" in tv_page
+    assert b"DAILY TARGET CRUSHED" in tv_page and b"targetState" in tv_page and b"/api/tv-dashboard" in tv_page
     assert b"labor cost" not in tv_page.lower() and b"Production Performance by Time Period" in dashboard_page
     assert b"Orders by Ship Month" in production_page and b'type="month"' in production_page
     assert b"PO# optional" in production_page and b"showOrderDetail" in dashboard_page and b"Active Orders by PO#" in dashboard_page
-    assert b"buildPOGroups" in dashboard_page and b"showPOGroup" in dashboard_page and b"Packaging Requirements" in dashboard_page
+    assert b"buildPOGroups" in dashboard_page and b"showPOGroup" in dashboard_page and b"/api/dashboard-summary" in dashboard_page and b"Packaging Requirements" in dashboard_page
     assert b"Grouped by PO#" in reporting_page and b"This Month" in reporting_page and b'<option value="category">Category</option>' in reporting_page
     for route in ("/api/reports/category.csv", "/api/reports/labor.csv"):
         assert call("GET", route, token=admin)[0] == 200, route

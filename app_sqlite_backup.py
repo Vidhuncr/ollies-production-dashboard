@@ -763,6 +763,18 @@ CREATE TABLE IF NOT EXISTS production_targets (
   updated_at TEXT NOT NULL DEFAULT '',
   updated_by TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS daily_production_targets (
+  id BIGSERIAL PRIMARY KEY,
+  target_date TEXT NOT NULL,
+  brand TEXT NOT NULL DEFAULT '',
+  color TEXT NOT NULL DEFAULT '',
+  unit TEXT NOT NULL CHECK(unit IN ('gallons','qty')),
+  amount NUMERIC NOT NULL CHECK(amount >= 0),
+  updated_at TEXT NOT NULL,
+  updated_by TEXT NOT NULL DEFAULT '',
+  UNIQUE(target_date,brand,color,unit)
+);
+CREATE INDEX IF NOT EXISTS idx_daily_targets_date ON daily_production_targets(target_date);
 CREATE INDEX IF NOT EXISTS idx_orders_ship_month ON orders(ship_month);
 CREATE INDEX IF NOT EXISTS idx_orders_s_number ON orders(s_number);
 CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at);
@@ -800,6 +812,7 @@ ALTER TABLE packaging_requirements ENABLE ROW LEVEL SECURITY;
 ALTER TABLE labor_rates ENABLE ROW LEVEL SECURITY;
 ALTER TABLE labor_entries ENABLE ROW LEVEL SECURITY;
 ALTER TABLE production_targets ENABLE ROW LEVEL SECURITY;
+ALTER TABLE daily_production_targets ENABLE ROW LEVEL SECURITY;
 """
 
 
@@ -991,6 +1004,17 @@ def initialize():
           updated_at TEXT NOT NULL DEFAULT '',
           updated_by TEXT NOT NULL DEFAULT ''
         );
+        CREATE TABLE IF NOT EXISTS daily_production_targets (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          target_date TEXT NOT NULL,
+          brand TEXT NOT NULL DEFAULT '',
+          color TEXT NOT NULL DEFAULT '',
+          unit TEXT NOT NULL CHECK(unit IN ('gallons','qty')),
+          amount REAL NOT NULL CHECK(amount >= 0),
+          updated_at TEXT NOT NULL,
+          updated_by TEXT NOT NULL DEFAULT '',
+          UNIQUE(target_date,brand,color,unit)
+        );
         """)
         con.execute("CREATE INDEX IF NOT EXISTS idx_packaging_s_number ON packaging(s_number)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_packaging_order ON packaging(order_id)")
@@ -1006,6 +1030,7 @@ def initialize():
         con.execute("CREATE INDEX IF NOT EXISTS idx_stock_packaging_production ON stock_packaging(production_id)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_stock_needs_product ON stock_needs(brand,color,unit,created_at)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_stock_need_fulfillments_need ON stock_need_fulfillments(need_id)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_daily_targets_date ON daily_production_targets(target_date)")
         if not con.execute("SELECT 1 FROM production_targets WHERE id=1").fetchone():
             con.execute("INSERT INTO production_targets(id,daily_gallons,daily_qty,updated_at,updated_by) VALUES(1,0,0,?,?)",
                         (datetime.now().isoformat(timespec="seconds"), "System"))
@@ -1219,10 +1244,67 @@ def _period_metrics_sql(con, start="", end=""):
     return result
 
 
+def _target_plan_sql(con, start, end, defaults):
+    """Return effective targets, preferring a combined goal over per-product goals for each day/unit."""
+    if not start or not end or end <= start:
+        return {"gallons": 0.0, "qty": 0.0}
+    rows = [dict(x) for x in con.execute("""SELECT target_date,brand,color,unit,amount
+      FROM daily_production_targets WHERE target_date>=? AND target_date<? ORDER BY target_date,id""",
+      (start.isoformat(), end.isoformat())).fetchall()]
+    by_day = {}
+    for row in rows:
+        by_day.setdefault((row["target_date"], row["unit"]), []).append(row)
+    result = {"gallons": 0.0, "qty": 0.0}
+    for offset in range((end-start).days):
+        day = (start+timedelta(days=offset)).isoformat()
+        for unit in ("gallons", "qty"):
+            unit_rows = by_day.get((day, unit), [])
+            combined = [x for x in unit_rows if not x["brand"] and not x["color"]]
+            if combined:
+                amount = sum(float(x["amount"]) for x in combined)
+            elif unit_rows:
+                amount = sum(float(x["amount"]) for x in unit_rows)
+            else:
+                amount = float(defaults.get(f"daily_{unit}", 0) or 0)
+            result[unit] += amount
+    return {key: round(value, 2) for key, value in result.items()}
+
+
+def _today_target_breakdown_sql(con, target_date, defaults):
+    rows = [dict(x) for x in con.execute("""SELECT id,target_date,brand,color,unit,amount,updated_at,updated_by
+      FROM daily_production_targets WHERE target_date=? AND amount>0 ORDER BY unit,brand,color,id""", (target_date,)).fetchall()]
+    actual_rows = con.execute("""SELECT brand,color,unit,ROUND(SUM(gallons),2) amount FROM production
+      WHERE produced_at>=? AND produced_at<? GROUP BY brand,color,unit""",
+      (target_date, (date.fromisoformat(target_date)+timedelta(days=1)).isoformat())).fetchall()
+    actual = {(x["brand"],x["color"],x["unit"]): float(x["amount"]) for x in actual_rows}
+    result = []
+    for unit in ("gallons", "qty"):
+        unit_rows = [x for x in rows if x["unit"] == unit]
+        combined = [x for x in unit_rows if not x["brand"] and not x["color"]]
+        if combined:
+            selected = combined
+        elif unit_rows:
+            selected = unit_rows
+        elif float(defaults.get(f"daily_{unit}", 0) or 0) > 0:
+            selected = [{"id": 0, "target_date": target_date, "brand": "", "color": "", "unit": unit,
+                         "amount": defaults[f"daily_{unit}"], "updated_at": defaults.get("updated_at", ""),
+                         "updated_by": defaults.get("updated_by", "")}]
+        else:
+            selected = []
+        for row in selected:
+            produced = (sum(value for (brand,color,row_unit),value in actual.items() if row_unit == unit)
+                        if not row["brand"] else actual.get((row["brand"],row["color"],unit), 0.0))
+            target = float(row["amount"])
+            result.append({**row, "amount": target, "produced": round(produced,2),
+                           "percent": round(produced/target*100,1) if target else 0,
+                           "achieved": bool(target and produced >= target)})
+    return result
+
+
 def production_performance_sql(con):
     today_value = date.today(); tomorrow_value = today_value + timedelta(days=1)
     target_row = con.execute("SELECT daily_gallons,daily_qty,updated_at,updated_by FROM production_targets WHERE id=1").fetchone()
-    targets = {
+    defaults = {
       "daily_gallons": float(target_row["daily_gallons"]) if target_row else 0.0,
       "daily_qty": float(target_row["daily_qty"]) if target_row else 0.0,
       "updated_at": target_row["updated_at"] if target_row else "",
@@ -1240,8 +1322,8 @@ def production_performance_sql(con):
         previous = _period_metrics_sql(con, previous_start.isoformat(), previous_end.isoformat()) if previous_start else None
         periods.append({"key": key, "label": label, "start": start.isoformat() if start else "",
           "end": (end-timedelta(days=1)).isoformat() if end else "", "current": current, "previous": previous,
-          "target": {"gallons": round(targets["daily_gallons"]*target_days, 2),
-                     "qty": round(targets["daily_qty"]*target_days, 2), "days": target_days}})
+          "target": {**(_target_plan_sql(con,start,end,defaults) if target_days else {"gallons": 0.0,"qty": 0.0}),
+                     "days": target_days}})
     history_start = today_value - timedelta(days=13)
     history_rows = con.execute("""SELECT substr(produced_at,1,10) AS production_day,unit,ROUND(SUM(gallons),2) amount
       FROM production WHERE produced_at>=? AND produced_at<? GROUP BY substr(produced_at,1,10),unit ORDER BY production_day""",
@@ -1253,7 +1335,10 @@ def production_performance_sql(con):
     mix = [dict(x) for x in con.execute("""SELECT brand,unit,ROUND(SUM(gallons),2) amount FROM production
       WHERE produced_at>=? AND produced_at<? GROUP BY brand,unit ORDER BY amount DESC""",
       ((today_value-timedelta(days=29)).isoformat(), tomorrow_value.isoformat())).fetchall()]
-    return {"periods": periods, "daily_history": list(by_day.values()), "category_mix": mix, "targets": targets}
+    today_targets = _target_plan_sql(con,today_value,tomorrow_value,defaults)
+    targets = {**defaults, "daily_gallons": today_targets["gallons"], "daily_qty": today_targets["qty"]}
+    return {"periods": periods, "daily_history": list(by_day.values()), "category_mix": mix, "targets": targets,
+            "target_breakdown": _today_target_breakdown_sql(con,today_value.isoformat(),defaults)}
 
 
 def dashboard_data():
@@ -1429,6 +1514,89 @@ def dashboard_data():
             "targets": performance["targets"]}
 
 
+def _order_schedule_sql(con):
+    current_month = date.today().isoformat()[:7]
+    rows = con.execute("""SELECT o.id,o.s_number,o.po_number,o.brand,o.color,o.unit,o.gallons,o.ship_month,o.created_at,
+      ROUND(COALESCE(SUM(p.gallons),0),2) produced,
+      ROUND(CASE WHEN o.gallons-COALESCE(SUM(p.gallons),0)>0 THEN o.gallons-COALESCE(SUM(p.gallons),0) ELSE 0 END,2) remaining,
+      s.ready_at,s.shipped_at FROM orders o LEFT JOIN production p ON p.order_id=o.id
+      LEFT JOIN s_number_status s ON s.s_number=o.s_number WHERE s.shipped_at IS NULL OR o.ship_month>=?
+      GROUP BY o.id,s.ready_at,s.shipped_at
+      ORDER BY CASE WHEN o.ship_month='' THEN 1 ELSE 0 END,o.ship_month,o.s_number,o.id""", (current_month,)).fetchall()
+    result = []
+    for raw in rows:
+        row = dict(raw)
+        row["status"] = "Shipped" if row["shipped_at"] else "Ready" if row["ready_at"] else "Packaging" if float(row["remaining"]) <= .0001 else "In Production" if float(row["produced"]) > .0001 else "Not Started"
+        result.append(row)
+    return result
+
+
+def tv_dashboard_data():
+    """Small public payload for the floor TV; avoids loading inventory, shipping, and costing records."""
+    with closing(connect()) as con:
+        return {"performance": production_performance_sql(con), "order_schedule": _order_schedule_sql(con)}
+
+
+def dashboard_summary_data():
+    """Fast management landing-page payload with drill-down data loaded only after a click."""
+    today = date.today().isoformat(); tomorrow = (date.today()+timedelta(days=1)).isoformat()
+    with closing(connect()) as con:
+        need = [dict(x) for x in con.execute("""SELECT brand,color,unit,ROUND(SUM(remaining),2) gallons FROM (
+          SELECT o.brand,o.color,o.unit,o.gallons-COALESCE(SUM(p.gallons),0) remaining
+          FROM orders o LEFT JOIN production p ON p.order_id=o.id GROUP BY o.id
+        ) WHERE remaining>0.0001 GROUP BY brand,color,unit ORDER BY gallons DESC""").fetchall()]
+        stock_needs = stock_need_rows_sql(con)
+        for item in stock_needs:
+            if float(item["remaining"]) <= .0001: continue
+            existing = next((x for x in need if x["brand"]==item["brand"] and x["color"]==item["color"] and x["unit"]==item["unit"]),None)
+            if existing: existing["gallons"] = round(float(existing["gallons"])+float(item["remaining"]),2)
+            else: need.append({"brand":item["brand"],"color":item["color"],"unit":item["unit"],"gallons":item["remaining"]})
+        need.sort(key=lambda x:float(x["gallons"]),reverse=True)
+        daily = [dict(x) for x in con.execute("""SELECT brand,color,unit,ROUND(SUM(gallons),2) gallons FROM production
+          WHERE produced_at>=? AND produced_at<? GROUP BY brand,color,unit ORDER BY gallons DESC""", (today,tomorrow)).fetchall()]
+        total = [dict(x) for x in con.execute("""SELECT brand,color,unit,ROUND(SUM(gallons),2) gallons FROM production
+          GROUP BY brand,color,unit ORDER BY gallons DESC""").fetchall()]
+        active_orders = [dict(x) for x in con.execute("""SELECT o.id,o.s_number,o.po_number,o.brand,o.color,o.gallons,o.unit,o.ship_month,o.created_at
+          FROM orders o LEFT JOIN s_number_status s ON s.s_number=o.s_number
+          WHERE s.shipped_at IS NULL ORDER BY o.s_number,o.brand,o.color,o.id""").fetchall()]
+        statuses = con.execute("""SELECT DISTINCT o.s_number,s.done_at,s.done_by,s.ready_at,s.ready_by,s.shipped_at,s.shipped_by
+          FROM orders o LEFT JOIN s_number_status s ON s.s_number=o.s_number WHERE s.shipped_at IS NULL ORDER BY o.s_number""").fetchall()
+        remaining_by_s = {}
+        for row in con.execute("""SELECT s_number,unit,ROUND(SUM(CASE WHEN remaining>0 THEN remaining ELSE 0 END),2) remaining FROM (
+          SELECT o.id,o.s_number,o.unit,o.gallons-COALESCE(SUM(p.gallons),0) remaining
+          FROM orders o LEFT JOIN production p ON p.order_id=o.id GROUP BY o.id) GROUP BY s_number,unit""").fetchall():
+            remaining_by_s.setdefault(row["s_number"],{})[row["unit"]] = float(row["remaining"])
+        unpackaged_by_s = {}
+        for row in con.execute("""SELECT s_number,unit,ROUND(SUM(CASE WHEN available>0 THEN available ELSE 0 END),2) available FROM (
+          SELECT o.id,o.s_number,o.unit,COALESCE(SUM(p.gallons),0)-COALESCE((SELECT SUM(k.gallons) FROM packaging k WHERE k.order_id=o.id),0) available
+          FROM orders o LEFT JOIN production p ON p.order_id=o.id GROUP BY o.id) GROUP BY s_number,unit""").fetchall():
+            unpackaged_by_s.setdefault(row["s_number"],{})[row["unit"]] = float(row["available"])
+        packed_by_s = {row["s_number"]:row for row in con.execute("""SELECT k.s_number,
+          COALESCE(SUM(k.package_count-COALESCE((SELECT SUM(h.package_count) FROM shipments h WHERE h.packaging_id=k.id),0)),0) package_count,
+          COALESCE(SUM((k.package_count-COALESCE((SELECT SUM(h.package_count) FROM shipments h WHERE h.packaging_id=k.id),0))*k.package_size),0) packaged_gallons
+          FROM packaging k GROUP BY k.s_number""").fetchall()}
+        po_numbers_by_s = {}
+        for row in con.execute("SELECT s_number,po_number FROM orders WHERE trim(po_number)<>'' ORDER BY id").fetchall():
+            values=po_numbers_by_s.setdefault(row["s_number"],[])
+            if row["po_number"] not in values: values.append(row["po_number"])
+        s_numbers=[]
+        for status in statuses:
+            remaining=remaining_by_s.get(status["s_number"],{}); unpackaged=unpackaged_by_s.get(status["s_number"],{}); packed=packed_by_s.get(status["s_number"])
+            po_numbers=po_numbers_by_s.get(status["s_number"],[])
+            s_numbers.append({**dict(status),"po_number":", ".join(po_numbers),"po_numbers":po_numbers,
+              "remaining_gallons":remaining.get("gallons",0),"remaining_qty":remaining.get("qty",0),
+              "unpackaged_gallons":unpackaged.get("gallons",0),"unpackaged_qty":unpackaged.get("qty",0),
+              "package_count":int(packed["package_count"]) if packed else 0,
+              "packaged_gallons":round(float(packed["packaged_gallons"]),2) if packed else 0})
+        active_inventory_packages = con.execute("""SELECT COALESCE(SUM(available_count),0) FROM (
+          SELECT k.package_count-COALESCE((SELECT SUM(h.package_count) FROM shipments h WHERE h.packaging_id=k.id),0) available_count FROM packaging k
+          UNION ALL SELECT package_count FROM stock_packaging) WHERE available_count>0""").fetchone()[0]
+        performance = production_performance_sql(con)
+    return {"performance":performance,"targets":performance["targets"],"need":need,"daily":daily,"total":total,
+            "active_orders":active_orders,"s_numbers":s_numbers,"active_inventory_packages":int(active_inventory_packages or 0),
+            "package_types":package_type_data()}
+
+
 def s_number_detail(s_number):
     """Return the complete, read-only production story for one order reference."""
     reference = str(s_number or "").strip().upper()
@@ -1562,6 +1730,9 @@ def admin_data():
           WHERE k.order_id=r.order_id AND k.package_type=r.package_type),0) completed_count
           FROM packaging_requirements r JOIN orders o ON o.id=r.order_id ORDER BY r.s_number,r.brand,r.color""").fetchall()
         target = con.execute("SELECT daily_gallons,daily_qty,updated_at,updated_by FROM production_targets WHERE id=1").fetchone()
+        daily_targets = con.execute("""SELECT id,target_date,brand,color,unit,amount,updated_at,updated_by
+          FROM daily_production_targets WHERE target_date>=? ORDER BY target_date DESC,unit,brand,color,id""",
+          ((date.today()-timedelta(days=7)).isoformat(),)).fetchall()
         order_rows = [dict(x) for x in orders]
         for order in order_rows:
             order["recipient_ids"] = [x[0] for x in con.execute("SELECT contact_id FROM order_recipients WHERE order_id=?", (order["id"],)).fetchall()]
@@ -1569,7 +1740,8 @@ def admin_data():
             "catalog": [dict(x) for x in catalog], "contacts": [dict(x) for x in contacts],
             "packaging": [dict(x) for x in packaging], "shipments": [dict(x) for x in shipments],
             "stock_packaging": [dict(x) for x in stock_packaging], "packaging_requirements": [dict(x) for x in requirements],
-            "package_types": package_type_data(), "targets": dict(target) if target else {"daily_gallons": 0, "daily_qty": 0}}
+            "package_types": package_type_data(), "targets": dict(target) if target else {"daily_gallons": 0, "daily_qty": 0},
+            "daily_targets": [dict(x) for x in daily_targets]}
 
 
 def contact_data():
@@ -2025,6 +2197,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"ok": True, "database": "supabase" if USE_SUPABASE else "sqlite"})
             except Exception:
                 return self.send_json({"ok": False}, 503)
+        if path == "/api/tv-dashboard": return self.send_json(cached_read("tv-dashboard", tv_dashboard_data, 5))
+        if path == "/api/dashboard-summary":
+            if not self.authorized(): return
+            return self.send_json(cached_read("dashboard-summary", dashboard_summary_data, 5))
         if path == "/api/dashboard": return self.send_json(cached_dashboard_data())
         detail_match = re.fullmatch(r"/api/s-numbers/([^/]+)/detail", path)
         if detail_match:
@@ -2128,6 +2304,33 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(200); self.send_header("Content-Type", "application/json")
                 self.send_header("Set-Cookie", self.session_cookie())
                 self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data); return
+            if path == "/api/daily-targets":
+                user = self.require_role("edit")
+                if not user: return
+                target_date = str(payload.get("target_date", "")).strip()
+                if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", target_date): raise ValueError("Select a target date.")
+                try: date.fromisoformat(target_date)
+                except ValueError: raise ValueError("Select a valid target date.")
+                scope = str(payload.get("scope", "combined")).strip().lower()
+                brand = str(payload.get("brand", "")).strip() if scope == "product" else ""
+                color = str(payload.get("color", "")).strip() if scope == "product" else ""
+                unit = str(payload.get("unit", "")).strip().lower()
+                amount = float(payload.get("amount", 0))
+                if amount < 0 or amount > 1000000000: raise ValueError("Target must be zero or a positive number below one billion.")
+                actor = user.get("display_name") or user.get("email") or user.get("username", "")
+                with closing(connect()) as con:
+                    if scope == "product":
+                        item = con.execute("SELECT unit FROM catalog WHERE category=? AND color=?", (brand,color)).fetchone()
+                        if not item: raise ValueError("Select a category and color from the catalog.")
+                        unit = item["unit"]
+                    elif scope != "combined" or unit not in ("gallons","qty"):
+                        raise ValueError("Select a combined unit or a category target.")
+                    now = datetime.now().isoformat(timespec="seconds")
+                    con.execute("""INSERT INTO daily_production_targets(target_date,brand,color,unit,amount,updated_at,updated_by)
+                      VALUES(?,?,?,?,?,?,?) ON CONFLICT(target_date,brand,color,unit) DO UPDATE SET
+                      amount=excluded.amount,updated_at=excluded.updated_at,updated_by=excluded.updated_by""",
+                      (target_date,brand,color,unit,round(amount,2),now,actor)); con.commit()
+                return self.send_json({"ok":True,"target_date":target_date,"brand":brand,"color":color,"unit":unit,"amount":round(amount,2)})
             if path == "/api/targets":
                 user = self.require_role("admin")
                 if not user: return
@@ -2911,6 +3114,9 @@ class Handler(BaseHTTPRequestHandler):
                     if fulfilled>.0001: raise ValueError("A production need with completed production cannot be deleted. Edit its total amount instead.")
                     cur=con.execute("DELETE FROM stock_needs WHERE id=?",(record_id,))
                     if not cur.rowcount: raise ValueError("Production need was not found.")
+                elif kind == "daily-targets":
+                    cur=con.execute("DELETE FROM daily_production_targets WHERE id=?",(record_id,))
+                    if not cur.rowcount: raise ValueError("Daily production target was not found.")
                 elif kind == "orders":
                     lock_order_sql(con, record_id)
                     count = con.execute("SELECT COUNT(*) FROM production WHERE order_id=?", (record_id,)).fetchone()[0]
