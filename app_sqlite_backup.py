@@ -1213,13 +1213,13 @@ def production_performance_sql(con):
         periods.append({"key": key, "label": label, "start": start.isoformat() if start else "",
           "end": (end-timedelta(days=1)).isoformat() if end else "", "current": current, "previous": previous})
     history_start = today_value - timedelta(days=13)
-    history_rows = con.execute("""SELECT substr(produced_at,1,10) day,unit,ROUND(SUM(gallons),2) amount
-      FROM production WHERE produced_at>=? AND produced_at<? GROUP BY substr(produced_at,1,10),unit ORDER BY day""",
+    history_rows = con.execute("""SELECT substr(produced_at,1,10) AS production_day,unit,ROUND(SUM(gallons),2) amount
+      FROM production WHERE produced_at>=? AND produced_at<? GROUP BY substr(produced_at,1,10),unit ORDER BY production_day""",
       (history_start.isoformat(), tomorrow_value.isoformat())).fetchall()
     by_day = {str(history_start+timedelta(days=offset)): {"day": str(history_start+timedelta(days=offset)), "gallons": 0.0, "qty": 0.0}
               for offset in range(14)}
     for row in history_rows:
-        by_day[row["day"]]["qty" if row["unit"] == "qty" else "gallons"] = float(row["amount"])
+        by_day[row["production_day"]]["qty" if row["unit"] == "qty" else "gallons"] = float(row["amount"])
     mix = [dict(x) for x in con.execute("""SELECT brand,unit,ROUND(SUM(gallons),2) amount FROM production
       WHERE produced_at>=? AND produced_at<? GROUP BY brand,unit ORDER BY amount DESC""",
       ((today_value-timedelta(days=29)).isoformat(), tomorrow_value.isoformat())).fetchall()]
@@ -1231,7 +1231,6 @@ def dashboard_data():
     tomorrow = (date.today() + timedelta(days=1)).isoformat()
     current_month = today[:7]
     with closing(connect()) as con:
-        performance = production_performance_sql(con)
         orders = con.execute("""
           SELECT o.id, o.s_number, o.po_number, o.brand, o.color, o.unit, o.gallons, o.ship_month, o.created_at,
                  ROUND(o.gallons - COALESCE(SUM(p.gallons),0),2) remaining
@@ -1373,6 +1372,14 @@ def dashboard_data():
                               "unpackaged_qty": unpackaged.get("qty",0),
                               "package_count": int(packed["package_count"]) if packed else 0,
                               "packaged_gallons": round(float(packed["packaged_gallons"]),2) if packed else 0})
+    performance = {"periods": [], "daily_history": [], "category_mix": []}
+    try:
+        with closing(connect()) as performance_connection:
+            performance = production_performance_sql(performance_connection)
+    except DatabaseOperationalError as exc:
+        # The core production/order dashboard must remain available even if an
+        # optional trend query is temporarily unavailable.
+        print(f"Performance visualization temporarily unavailable: {exc}", file=sys.stderr, flush=True)
     need_rows=[dict(x) for x in need]
     for stock_need in stock_needs:
         if float(stock_need["remaining"])<=.0001: continue

@@ -24,6 +24,7 @@ gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
 entrypoint = (ROOT / "app.py").read_text(encoding="utf-8")
 migration = (ROOT / "migrate_sqlite_to_supabase.py").read_text(encoding="utf-8")
 admin_page = (ROOT / "admin.html").read_text(encoding="utf-8")
+backend_source = Path(backend.__file__).read_text(encoding="utf-8")
 assert "psycopg" in requirements
 assert "SUPABASE_DATABASE_URL" in render
 assert "EMAIL_ENABLED" in render and 'value: "false"' in render
@@ -32,7 +33,9 @@ assert "DB_POOL_MAX" in render and "MAX_REQUEST_THREADS" in render and "DASHBOAR
 assert "idx_production_order" in backend.SUPABASE_SCHEMA and "idx_packaging_order_type" in backend.SUPABASE_SCHEMA
 assert hasattr(backend, "PostgresPool") and hasattr(backend, "BoundedThreadingHTTPServer")
 assert hasattr(backend, "production_performance_sql") and hasattr(backend, "normalize_report_date")
-assert hasattr(backend, "decode_session") and "hmac.new(SESSION_SECRET" in Path(backend.__file__).read_text(encoding="utf-8")
+assert "AS production_day" in backend_source and 'row["production_day"]' in backend_source
+assert "substr(produced_at,1,10) day" not in backend_source
+assert hasattr(backend, "decode_session") and "hmac.new(SESSION_SECRET" in backend_source
 assert "saveContact" in admin_page and "contactActive" in admin_page and "Email recipient updated" in admin_page
 assert "poNumber" in admin_page and hasattr(backend, "send_order_created_email")
 assert "*.db" in gitignore and ".env" in gitignore and ".venv/" in gitignore
