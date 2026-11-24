@@ -31,6 +31,7 @@ assert "EMAIL_PROVIDER" in render and "GOOGLE_APPS_SCRIPT_URL" in render and "GO
 assert "DB_POOL_MAX" in render and "MAX_REQUEST_THREADS" in render and "DASHBOARD_CACHE_TTL" in render
 assert "idx_production_order" in backend.SUPABASE_SCHEMA and "idx_packaging_order_type" in backend.SUPABASE_SCHEMA
 assert hasattr(backend, "PostgresPool") and hasattr(backend, "BoundedThreadingHTTPServer")
+assert hasattr(backend, "production_performance_sql") and hasattr(backend, "normalize_report_date")
 assert hasattr(backend, "decode_session") and "hmac.new(SESSION_SECRET" in Path(backend.__file__).read_text(encoding="utf-8")
 assert "saveContact" in admin_page and "contactActive" in admin_page and "Email recipient updated" in admin_page
 assert "poNumber" in admin_page and hasattr(backend, "send_order_created_email")

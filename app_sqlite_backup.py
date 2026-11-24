@@ -21,7 +21,7 @@ from pathlib import Path
 from email.message import EmailMessage
 from queue import Empty, Full, LifoQueue
 from urllib.error import HTTPError, URLError
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import Request, urlopen
 
 try:
@@ -1071,11 +1071,84 @@ def release_stock_need_sql(con, production_id, amount):
     return released
 
 
+def _date_range_sql(column, start="", end=""):
+    clauses, params = [], []
+    if start:
+        clauses.append(f"{column}>=?"); params.append(start)
+    if end:
+        clauses.append(f"{column}<?"); params.append(end)
+    return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
+
+
+def _period_metrics_sql(con, start="", end=""):
+    production_where, production_params = _date_range_sql("produced_at", start, end)
+    order_where, order_params = _date_range_sql("created_at", start, end)
+    labor_where, labor_params = _date_range_sql("worked_at", start, end)
+    package_where, package_params = _date_range_sql("k.packaged_at", start, end)
+    shipment_where, shipment_params = _date_range_sql("h.shipped_at", start, end)
+    result = {"produced_gallons": 0.0, "produced_qty": 0.0, "required_gallons": 0.0,
+      "required_qty": 0.0, "packaged_gallons": 0.0, "packaged_qty": 0.0,
+      "shipped_gallons": 0.0, "shipped_qty": 0.0, "labor_hours": 0.0,
+      "labor_cost": 0.0, "batches": 0, "orders": 0, "packages": 0, "shipped_packages": 0}
+    for row in con.execute(f"SELECT unit,COALESCE(SUM(gallons),0) amount,COUNT(*) batches FROM production{production_where} GROUP BY unit", production_params).fetchall():
+        suffix = "qty" if row["unit"] == "qty" else "gallons"
+        result[f"produced_{suffix}"] = round(float(row["amount"]), 2); result["batches"] += int(row["batches"])
+    for row in con.execute(f"SELECT unit,COALESCE(SUM(gallons),0) amount,COUNT(*) orders FROM orders{order_where} GROUP BY unit", order_params).fetchall():
+        suffix = "qty" if row["unit"] == "qty" else "gallons"
+        result[f"required_{suffix}"] = round(float(row["amount"]), 2); result["orders"] += int(row["orders"])
+    labor = con.execute(f"SELECT COALESCE(SUM(hours),0) hours,COALESCE(SUM(labor_cost),0) cost FROM labor_entries{labor_where}", labor_params).fetchone()
+    result["labor_hours"] = round(float(labor["hours"]), 2); result["labor_cost"] = round(float(labor["cost"]), 2)
+    for row in con.execute(f"""SELECT o.unit,COALESCE(SUM(k.gallons),0) amount,COALESCE(SUM(k.package_count),0) packages
+      FROM packaging k JOIN orders o ON o.id=k.order_id{package_where} GROUP BY o.unit""", package_params).fetchall():
+        suffix = "qty" if row["unit"] == "qty" else "gallons"
+        result[f"packaged_{suffix}"] = round(float(row["amount"]), 2); result["packages"] += int(row["packages"])
+    stock_package_where, stock_package_params = _date_range_sql("k.packaged_at", start, end)
+    for row in con.execute(f"""SELECT p.unit,COALESCE(SUM(k.gallons),0) amount,COALESCE(SUM(k.package_count),0) packages
+      FROM stock_packaging k JOIN production p ON p.id=k.production_id{stock_package_where} GROUP BY p.unit""", stock_package_params).fetchall():
+        suffix = "qty" if row["unit"] == "qty" else "gallons"
+        result[f"packaged_{suffix}"] = round(result[f"packaged_{suffix}"]+float(row["amount"]), 2)
+        result["packages"] += int(row["packages"])
+    for row in con.execute(f"""SELECT o.unit,COALESCE(SUM(h.gallons),0) amount,COALESCE(SUM(h.package_count),0) packages
+      FROM shipments h JOIN packaging k ON k.id=h.packaging_id JOIN orders o ON o.id=k.order_id{shipment_where} GROUP BY o.unit""", shipment_params).fetchall():
+        suffix = "qty" if row["unit"] == "qty" else "gallons"
+        result[f"shipped_{suffix}"] = round(float(row["amount"]), 2); result["shipped_packages"] += int(row["packages"])
+    return result
+
+
+def production_performance_sql(con):
+    today_value = date.today(); tomorrow_value = today_value + timedelta(days=1)
+    definitions = [
+      ("today", "Today", today_value, tomorrow_value, today_value-timedelta(days=1), today_value),
+      ("week", "Last 7 Days", today_value-timedelta(days=6), tomorrow_value, today_value-timedelta(days=13), today_value-timedelta(days=6)),
+      ("month", "Last 30 Days", today_value-timedelta(days=29), tomorrow_value, today_value-timedelta(days=59), today_value-timedelta(days=29)),
+      ("lifetime", "Lifetime", None, None, None, None),
+    ]
+    periods = []
+    for key, label, start, end, previous_start, previous_end in definitions:
+        current = _period_metrics_sql(con, start.isoformat() if start else "", end.isoformat() if end else "")
+        previous = _period_metrics_sql(con, previous_start.isoformat(), previous_end.isoformat()) if previous_start else None
+        periods.append({"key": key, "label": label, "start": start.isoformat() if start else "",
+          "end": (end-timedelta(days=1)).isoformat() if end else "", "current": current, "previous": previous})
+    history_start = today_value - timedelta(days=13)
+    history_rows = con.execute("""SELECT substr(produced_at,1,10) day,unit,ROUND(SUM(gallons),2) amount
+      FROM production WHERE produced_at>=? AND produced_at<? GROUP BY substr(produced_at,1,10),unit ORDER BY day""",
+      (history_start.isoformat(), tomorrow_value.isoformat())).fetchall()
+    by_day = {str(history_start+timedelta(days=offset)): {"day": str(history_start+timedelta(days=offset)), "gallons": 0.0, "qty": 0.0}
+              for offset in range(14)}
+    for row in history_rows:
+        by_day[row["day"]]["qty" if row["unit"] == "qty" else "gallons"] = float(row["amount"])
+    mix = [dict(x) for x in con.execute("""SELECT brand,unit,ROUND(SUM(gallons),2) amount FROM production
+      WHERE produced_at>=? AND produced_at<? GROUP BY brand,unit ORDER BY amount DESC""",
+      ((today_value-timedelta(days=29)).isoformat(), tomorrow_value.isoformat())).fetchall()]
+    return {"periods": periods, "daily_history": list(by_day.values()), "category_mix": mix}
+
+
 def dashboard_data():
     today = date.today().isoformat()
     tomorrow = (date.today() + timedelta(days=1)).isoformat()
     current_month = today[:7]
     with closing(connect()) as con:
+        performance = production_performance_sql(con)
         orders = con.execute("""
           SELECT o.id, o.s_number, o.po_number, o.brand, o.color, o.unit, o.gallons, o.ship_month, o.created_at,
                  ROUND(o.gallons - COALESCE(SUM(p.gallons),0),2) remaining
@@ -1224,7 +1297,7 @@ def dashboard_data():
         if existing: existing["gallons"]=round(float(existing["gallons"])+float(stock_need["remaining"]),2)
         else: need_rows.append({"brand":stock_need["brand"],"color":stock_need["color"],"unit":stock_need["unit"],"gallons":stock_need["remaining"]})
     need_rows.sort(key=lambda x:float(x["gallons"]),reverse=True)
-    return {"today": today, "orders": order_rows, "active_orders": [dict(x) for x in active_orders], "order_schedule": order_schedule,
+    return {"today": today, "performance": performance, "orders": order_rows, "active_orders": [dict(x) for x in active_orders], "order_schedule": order_schedule,
             "requirement_orders": [dict(x) for x in requirement_orders],
             "need": need_rows, "daily": [dict(x) for x in daily],
             "total": [dict(x) for x in total], "recent": [dict(x) for x in recent],
@@ -1531,9 +1604,24 @@ def costing_data():
             "processes": ["Mixing / Production", "Quality Control", "Filling / Packaging", "Material Handling", "Shipping / Loading", "Other"]}
 
 
-def reporting_data():
+def normalize_report_date(value):
+    result = str(value or "").strip()
+    if not result:
+        return ""
+    try:
+        return date.fromisoformat(result).isoformat()
+    except ValueError:
+        raise ValueError("Report dates must use YYYY-MM-DD.")
+
+
+def reporting_data(date_from="", date_to=""):
+    date_from = normalize_report_date(date_from); date_to = normalize_report_date(date_to)
+    if date_from and date_to and date_from > date_to:
+        raise ValueError("The report start date cannot be after the end date.")
+    end_exclusive = (date.fromisoformat(date_to)+timedelta(days=1)).isoformat() if date_to else ""
     generated_at = datetime.now().isoformat(timespec="seconds")
     with closing(connect()) as con:
+        period_metrics = _period_metrics_sql(con, date_from, end_exclusive)
         order_rows = [dict(x) for x in con.execute("""SELECT o.id order_id,o.s_number,o.po_number,o.brand,o.color,o.unit,o.created_at,
           ROUND(o.gallons,2) required_amount,
           ROUND(COALESCE((SELECT SUM(p.gallons) FROM production p WHERE p.order_id=o.id),0),2) produced_amount,
@@ -1573,14 +1661,25 @@ def reporting_data():
           FROM stock_packaging k JOIN production p ON p.id=k.production_id GROUP BY p.unit""").fetchall()}
         total_labor_cost = float(con.execute("SELECT COALESCE(SUM(labor_cost),0) FROM labor_entries").fetchone()[0])
         stock_needs = stock_need_rows_sql(con)
+        order_range_where, order_range_params = _date_range_sql("o.created_at", date_from, end_exclusive)
+        need_rows = con.execute(f"""SELECT unit,ROUND(SUM(CASE WHEN remaining>0 THEN remaining ELSE 0 END),2) amount FROM (
+          SELECT o.id,o.unit,o.gallons-COALESCE((SELECT SUM(p.gallons) FROM production p WHERE p.order_id=o.id),0) remaining
+          FROM orders o{order_range_where}) ranged GROUP BY unit""", order_range_params).fetchall()
+        range_need = {x["unit"]: float(x["amount"]) for x in need_rows}
+        count_row = con.execute(f"""SELECT COUNT(DISTINCT o.s_number) s_numbers,
+          COUNT(DISTINCT CASE WHEN s.shipped_at IS NULL THEN o.s_number END) active_s_numbers
+          FROM orders o LEFT JOIN s_number_status s ON s.s_number=o.s_number{order_range_where}""", order_range_params).fetchone()
     for row in order_rows:
         row["status"] = "Shipped" if row["shipped_at"] else "Ready" if row["ready_at"] else "Packaging" if row["need_amount"] <= .0001 else "In Production"
     for row in package_rows:
         row["status"] = "Shipped" if row["shipped_at"] else "Ready" if row["ready_at"] and row["balance_count"] > 0 else "Packaging"
-    s_map = {}; category_map = {}
+    s_map = {}; category_map = {}; po_map = {}; category_po_map = {}
     for row in order_rows:
+        po_number = row["po_number"] or "No PO#"
         for target, key, base in ((s_map,(row["s_number"],row["unit"]),{"s_number":row["s_number"],"unit":row["unit"]}),
-                                  (category_map,(row["brand"],row["unit"]),{"brand":row["brand"],"unit":row["unit"]})):
+                                  (category_map,(row["brand"],row["unit"]),{"brand":row["brand"],"unit":row["unit"]}),
+                                  (po_map,(po_number,row["unit"]),{"po_number":po_number,"unit":row["unit"]}),
+                                  (category_po_map,(po_number,row["brand"],row["unit"]),{"po_number":po_number,"brand":row["brand"],"unit":row["unit"]})):
             item = target.setdefault(key,{**base,"required_amount":0.0,"produced_amount":0.0,"need_amount":0.0,"packaged_amount":0.0,
               "shipped_amount":0.0,"inventory_amount":0.0,"labor_hours":0.0,"labor_cost":0.0,"created_at":row["created_at"],"status":"Shipped"})
             for name in ("required_amount","produced_amount","need_amount","packaged_amount","shipped_amount","inventory_amount","labor_hours","labor_cost"):
@@ -1597,20 +1696,20 @@ def reporting_data():
         return result
     s_summary = finish(sorted(s_map.values(),key=lambda x:(x["s_number"],x["unit"])))
     category_summary = finish(sorted(category_map.values(),key=lambda x:(x["brand"].lower(),x["unit"])))
-    required = {"gallons":0.0,"qty":0.0}; need={"gallons":0.0,"qty":0.0}; shipped={"gallons":0.0,"qty":0.0}; inventory={"gallons":0.0,"qty":0.0}
-    for row in order_rows:
-        unit=row["unit"]; required[unit]+=float(row["required_amount"]); need[unit]+=float(row["need_amount"])
-        shipped[unit]+=float(row["shipped_amount"]); inventory[unit]+=float(row["inventory_amount"])
-    for row in stock_needs:
-        required[row["unit"]]+=float(row["amount"]); need[row["unit"]]+=float(row["remaining"])
-    for unit,amount in stock_inventory.items(): inventory[unit]+=amount
-    snapshot={"labor_cost":round(total_labor_cost,2),"required_gallons":round(required["gallons"],2),"required_qty":round(required["qty"],2),
-      "produced_gallons":round(produced_totals.get("gallons",0),2),"produced_qty":round(produced_totals.get("qty",0),2),
-      "need_gallons":round(need["gallons"],2),"need_qty":round(need["qty"],2),"shipped_gallons":round(shipped["gallons"],2),
-      "shipped_qty":round(shipped["qty"],2),"inventory_gallons":round(inventory["gallons"],2),"inventory_qty":round(inventory["qty"],2),
-      "s_numbers":len({x["s_number"] for x in order_rows}),"active_s_numbers":len({x["s_number"] for x in order_rows if x["status"]!="Shipped"})}
+    po_summary = finish(sorted(po_map.values(),key=lambda x:(x["po_number"].lower(),x["unit"])))
+    category_po_summary = finish(sorted(category_po_map.values(),key=lambda x:(x["po_number"].lower(),x["brand"].lower(),x["unit"])))
+    selected_stock_needs = [x for x in stock_needs if (not date_from or x["created_at"][:10]>=date_from) and (not date_to or x["created_at"][:10]<=date_to)]
+    for row in selected_stock_needs:
+        period_metrics[f"required_{'qty' if row['unit']=='qty' else 'gallons'}"] += float(row["amount"])
+        range_need[row["unit"]] = range_need.get(row["unit"], 0)+float(row["remaining"])
+    snapshot={**period_metrics,"date_from":date_from,"date_to":date_to,
+      "need_gallons":round(range_need.get("gallons",0),2),"need_qty":round(range_need.get("qty",0),2),
+      "inventory_gallons":round(max(period_metrics["packaged_gallons"]-period_metrics["shipped_gallons"],0),2),
+      "inventory_qty":round(max(period_metrics["packaged_qty"]-period_metrics["shipped_qty"],0),2),
+      "s_numbers":int(count_row["s_numbers"] or 0),"active_s_numbers":int(count_row["active_s_numbers"] or 0)}
     return {"generated_at":generated_at,"snapshot":snapshot,"product_lines":order_rows,"s_summary":s_summary,
-            "category_summary":category_summary,"package_rows":package_rows,"stock_needs":stock_needs,"package_types":package_type_data()}
+            "category_summary":category_summary,"po_summary":po_summary,"category_po_summary":category_po_summary,
+            "package_rows":package_rows,"stock_needs":stock_needs,"package_types":package_type_data()}
 
 
 def record_labor_sql(con, payload, order=None, production=None, process_name="Production", actor="System"):
@@ -1777,7 +1876,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(costing_data())
         if path == "/api/reporting":
             if not self.authorized(): return
-            return self.send_json(reporting_data())
+            query = parse_qs(urlparse(self.path).query)
+            try:
+                return self.send_json(reporting_data(query.get("from", [""])[0], query.get("to", [""])[0]))
+            except ValueError as exc:
+                return self.send_json({"error": str(exc)}, 400)
         if path == "/api/reports/labor.csv":
             if not self.authorized(): return
             return self.send_csv(labor_report_csv(), f"ollies-labor-cost-{date.today().isoformat()}.csv")

@@ -128,6 +128,8 @@ try:
     ok("POST", "/api/orders", {"s_number": "S10001", "brand": "Paint", "color": "Blue", "gallons": 100, "ship_month": "2026-11"}, team, 201)
     dashboard, _ = ok("GET", "/api/dashboard")
     gallon_order = next(x for x in dashboard["orders"] if x["s_number"] == "S10001")
+    assert [x["key"] for x in dashboard["performance"]["periods"]] == ["today", "week", "month", "lifetime"]
+    assert len(dashboard["performance"]["daily_history"]) == 14
     assert gallon_order["ship_month"] == "2026-11"
     assert next(x for x in dashboard["order_schedule"] if x["s_number"] == "S10001")["status"] == "Not Started"
     production, _ = ok("POST", "/api/production", {"order_id": gallon_order["id"], "batch_number": "G-BATCH-1", "gallons": 100, "rate_id": rate_id, "labor_hours": 2}, team, 201)
@@ -352,9 +354,12 @@ try:
     tv_page = call("GET", "/tv", token=admin)[1]
     production_page = call("GET", "/production", token=admin)[1]
     dashboard_page = call("GET", "/", token=admin)[1]
-    assert b"Changes every 15 seconds" in tv_page and b"Orders by Ship Month" in tv_page
+    reporting_page = call("GET", "/reporting", token=admin)[1]
+    assert b"Changes every 15 seconds" in tv_page and b"14-Day Production Trend" in tv_page
+    assert b"labor cost" not in tv_page.lower() and b"Production Performance by Time Period" in dashboard_page
     assert b"Orders by Ship Month" in production_page and b'type="month"' in production_page
     assert b"PO# optional" in production_page and b"showOrderDetail" in dashboard_page and b"Packaging Requirements" in dashboard_page
+    assert b"Grouped by PO#" in reporting_page and b"This Month" in reporting_page and b'<option value="category">Category</option>' in reporting_page
     for route in ("/api/reports/category.csv", "/api/reports/labor.csv"):
         assert call("GET", route, token=admin)[0] == 200, route
     report, _ = ok("GET", "/api/reporting", token=admin)
@@ -368,6 +373,13 @@ try:
     assert feed_report["produced_amount"] == 5 and feed_report["shipped_amount"] == 5 and feed_report["status"] == "Shipped"
     no_s_report = next(x for x in report["product_lines"] if x["s_number"] == no_s_order["s_number"])
     assert no_s_report["produced_amount"] == 3 and no_s_report["shipped_amount"] == 3 and no_s_report["status"] == "Shipped"
+    assert any(x["brand"] == "Paint" for x in report["category_summary"])
+    assert any(x["po_number"] == "PO-EDIT-10003" for x in report["po_summary"])
+    assert any(x["po_number"] == "PO-EDIT-10003" and x["brand"] == "Paint" for x in report["category_po_summary"])
+    ranged, _ = ok("GET", "/api/reporting?from=2026-11-01&to=2026-11-30", token=admin)
+    assert ranged["snapshot"]["date_from"] == "2026-11-01" and ranged["snapshot"]["date_to"] == "2026-11-30"
+    assert ranged["snapshot"]["batches"] > 0 and ranged["snapshot"]["labor_cost"] > 0
+    assert call("GET", "/api/reporting?from=2026-12-01&to=2026-11-01", token=admin)[0] == 400
 
     admin_data, _ = ok("GET", "/api/admin", token=admin)
     team_id = next(x["id"] for x in admin_data["users"] if x["email"] == "team@test.local")
@@ -376,7 +388,7 @@ try:
     assert call("POST", "/api/login", {"email": "team@test.local", "password": "TeamUser123!"})[0] == 401
     logout_status, _, logout_headers = call("GET", "/logout", token=admin)
     assert logout_status == 302 and "Max-Age=0" in logout_headers.get("Set-Cookie", "")
-    print("PASS: restart-safe login, recipient edit/enable/disable/delete, role-specific team entry, S# and no-S# customer orders, mixed manufacture-and-tint fulfillment, shared remaining need, catalog, future-stock needs, labor, packaging, stock rework, case packs, assignment, shipping, edit, undo, reports, pages, CSV, and user deletion")
+    print("PASS: restart-safe login, recipients, role entry, S#/PO# orders, manufacture/tint, future stock, labor, packaging, shipping, TV performance, date-range snapshots, category/PO grouping, edit/delete, CSV, and user deletion")
 finally:
     server.shutdown()
     server.server_close()
