@@ -349,6 +349,15 @@ try:
     assert next(x for x in admin_data["orders"] if x["id"] == stock_order_admin["id"])["po_number"] == "PO-EDIT-10003"
     assert call("DELETE", f"/api/admin/orders/{stock_order_admin['id']}", token=manager)[0] == 403
 
+    assert call("POST", "/api/targets", {"daily_gallons": 4, "daily_qty": 6}, manager)[0] == 403
+    targets, _ = ok("POST", "/api/targets", {"daily_gallons": 4, "daily_qty": 6}, admin)
+    assert targets["daily_gallons"] == 4 and targets["daily_qty"] == 6
+    dashboard, _ = ok("GET", "/api/dashboard")
+    assert dashboard["targets"]["daily_gallons"] == 4 and dashboard["targets"]["daily_qty"] == 6
+    performance_targets = {x["key"]: x["target"] for x in dashboard["performance"]["periods"]}
+    assert performance_targets["today"]["gallons"] == 4 and performance_targets["week"]["gallons"] == 28
+    assert performance_targets["month"]["qty"] == 180 and performance_targets["lifetime"]["gallons"] == 0
+
     for route in ("/", "/entry", "/production", "/inventory", "/shipping", "/costing", "/reporting", "/admin", "/tv"):
         assert call("GET", route, token=admin)[0] == 200, route
     tv_page = call("GET", "/tv", token=admin)[1]
@@ -356,9 +365,11 @@ try:
     dashboard_page = call("GET", "/", token=admin)[1]
     reporting_page = call("GET", "/reporting", token=admin)[1]
     assert b"Changes every 15 seconds" in tv_page and b"14-Day Production Trend" in tv_page
+    assert b"DAILY TARGET CRUSHED" in tv_page and b"targetState" in tv_page
     assert b"labor cost" not in tv_page.lower() and b"Production Performance by Time Period" in dashboard_page
     assert b"Orders by Ship Month" in production_page and b'type="month"' in production_page
-    assert b"PO# optional" in production_page and b"showOrderDetail" in dashboard_page and b"Packaging Requirements" in dashboard_page
+    assert b"PO# optional" in production_page and b"showOrderDetail" in dashboard_page and b"Active Orders by PO#" in dashboard_page
+    assert b"buildPOGroups" in dashboard_page and b"showPOGroup" in dashboard_page and b"Packaging Requirements" in dashboard_page
     assert b"Grouped by PO#" in reporting_page and b"This Month" in reporting_page and b'<option value="category">Category</option>' in reporting_page
     for route in ("/api/reports/category.csv", "/api/reports/labor.csv"):
         assert call("GET", route, token=admin)[0] == 200, route

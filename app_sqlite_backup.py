@@ -756,6 +756,13 @@ CREATE TABLE IF NOT EXISTS labor_entries (
   created_at TEXT NOT NULL,
   created_by TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS production_targets (
+  id INTEGER PRIMARY KEY CHECK(id = 1),
+  daily_gallons NUMERIC NOT NULL DEFAULT 0 CHECK(daily_gallons >= 0),
+  daily_qty NUMERIC NOT NULL DEFAULT 0 CHECK(daily_qty >= 0),
+  updated_at TEXT NOT NULL DEFAULT '',
+  updated_by TEXT NOT NULL DEFAULT ''
+);
 CREATE INDEX IF NOT EXISTS idx_orders_ship_month ON orders(ship_month);
 CREATE INDEX IF NOT EXISTS idx_orders_s_number ON orders(s_number);
 CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at);
@@ -792,6 +799,7 @@ ALTER TABLE stock_need_fulfillments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE packaging_requirements ENABLE ROW LEVEL SECURITY;
 ALTER TABLE labor_rates ENABLE ROW LEVEL SECURITY;
 ALTER TABLE labor_entries ENABLE ROW LEVEL SECURITY;
+ALTER TABLE production_targets ENABLE ROW LEVEL SECURITY;
 """
 
 
@@ -808,6 +816,9 @@ def initialize_supabase():
         for category, color, unit in (("Default", "White", "gallons"), ("Default", "Black", "gallons")):
             if not con.execute("SELECT 1 FROM catalog WHERE category=? AND color=?", (category, color)).fetchone():
                 con.execute("INSERT INTO catalog(category,color,unit) VALUES(?,?,?)", (category, color, unit))
+        if not con.execute("SELECT 1 FROM production_targets WHERE id=1").fetchone():
+            con.execute("INSERT INTO production_targets(id,daily_gallons,daily_qty,updated_at,updated_by) VALUES(1,0,0,?,?)",
+                        (datetime.now().isoformat(timespec="seconds"), "System"))
         con.commit()
 
 
@@ -973,6 +984,13 @@ def initialize():
           created_at TEXT NOT NULL,
           created_by TEXT NOT NULL DEFAULT ''
         );
+        CREATE TABLE IF NOT EXISTS production_targets (
+          id INTEGER PRIMARY KEY CHECK(id = 1),
+          daily_gallons REAL NOT NULL DEFAULT 0 CHECK(daily_gallons >= 0),
+          daily_qty REAL NOT NULL DEFAULT 0 CHECK(daily_qty >= 0),
+          updated_at TEXT NOT NULL DEFAULT '',
+          updated_by TEXT NOT NULL DEFAULT ''
+        );
         """)
         con.execute("CREATE INDEX IF NOT EXISTS idx_packaging_s_number ON packaging(s_number)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_packaging_order ON packaging(order_id)")
@@ -988,6 +1006,9 @@ def initialize():
         con.execute("CREATE INDEX IF NOT EXISTS idx_stock_packaging_production ON stock_packaging(production_id)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_stock_needs_product ON stock_needs(brand,color,unit,created_at)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_stock_need_fulfillments_need ON stock_need_fulfillments(need_id)")
+        if not con.execute("SELECT 1 FROM production_targets WHERE id=1").fetchone():
+            con.execute("INSERT INTO production_targets(id,daily_gallons,daily_qty,updated_at,updated_by) VALUES(1,0,0,?,?)",
+                        (datetime.now().isoformat(timespec="seconds"), "System"))
         con.execute("CREATE INDEX IF NOT EXISTS idx_stock_need_fulfillments_production ON stock_need_fulfillments(production_id)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_packaging_requirements_s ON packaging_requirements(s_number)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_labor_rates_name ON labor_rates(labor_name,effective_from)")
@@ -1200,18 +1221,27 @@ def _period_metrics_sql(con, start="", end=""):
 
 def production_performance_sql(con):
     today_value = date.today(); tomorrow_value = today_value + timedelta(days=1)
+    target_row = con.execute("SELECT daily_gallons,daily_qty,updated_at,updated_by FROM production_targets WHERE id=1").fetchone()
+    targets = {
+      "daily_gallons": float(target_row["daily_gallons"]) if target_row else 0.0,
+      "daily_qty": float(target_row["daily_qty"]) if target_row else 0.0,
+      "updated_at": target_row["updated_at"] if target_row else "",
+      "updated_by": target_row["updated_by"] if target_row else "",
+    }
     definitions = [
-      ("today", "Today", today_value, tomorrow_value, today_value-timedelta(days=1), today_value),
-      ("week", "Last 7 Days", today_value-timedelta(days=6), tomorrow_value, today_value-timedelta(days=13), today_value-timedelta(days=6)),
-      ("month", "Last 30 Days", today_value-timedelta(days=29), tomorrow_value, today_value-timedelta(days=59), today_value-timedelta(days=29)),
-      ("lifetime", "Lifetime", None, None, None, None),
+      ("today", "Today", today_value, tomorrow_value, today_value-timedelta(days=1), today_value, 1),
+      ("week", "Last 7 Days", today_value-timedelta(days=6), tomorrow_value, today_value-timedelta(days=13), today_value-timedelta(days=6), 7),
+      ("month", "Last 30 Days", today_value-timedelta(days=29), tomorrow_value, today_value-timedelta(days=59), today_value-timedelta(days=29), 30),
+      ("lifetime", "Lifetime", None, None, None, None, 0),
     ]
     periods = []
-    for key, label, start, end, previous_start, previous_end in definitions:
+    for key, label, start, end, previous_start, previous_end, target_days in definitions:
         current = _period_metrics_sql(con, start.isoformat() if start else "", end.isoformat() if end else "")
         previous = _period_metrics_sql(con, previous_start.isoformat(), previous_end.isoformat()) if previous_start else None
         periods.append({"key": key, "label": label, "start": start.isoformat() if start else "",
-          "end": (end-timedelta(days=1)).isoformat() if end else "", "current": current, "previous": previous})
+          "end": (end-timedelta(days=1)).isoformat() if end else "", "current": current, "previous": previous,
+          "target": {"gallons": round(targets["daily_gallons"]*target_days, 2),
+                     "qty": round(targets["daily_qty"]*target_days, 2), "days": target_days}})
     history_start = today_value - timedelta(days=13)
     history_rows = con.execute("""SELECT substr(produced_at,1,10) AS production_day,unit,ROUND(SUM(gallons),2) amount
       FROM production WHERE produced_at>=? AND produced_at<? GROUP BY substr(produced_at,1,10),unit ORDER BY production_day""",
@@ -1223,7 +1253,7 @@ def production_performance_sql(con):
     mix = [dict(x) for x in con.execute("""SELECT brand,unit,ROUND(SUM(gallons),2) amount FROM production
       WHERE produced_at>=? AND produced_at<? GROUP BY brand,unit ORDER BY amount DESC""",
       ((today_value-timedelta(days=29)).isoformat(), tomorrow_value.isoformat())).fetchall()]
-    return {"periods": periods, "daily_history": list(by_day.values()), "category_mix": mix}
+    return {"periods": periods, "daily_history": list(by_day.values()), "category_mix": mix, "targets": targets}
 
 
 def dashboard_data():
@@ -1372,7 +1402,8 @@ def dashboard_data():
                               "unpackaged_qty": unpackaged.get("qty",0),
                               "package_count": int(packed["package_count"]) if packed else 0,
                               "packaged_gallons": round(float(packed["packaged_gallons"]),2) if packed else 0})
-    performance = {"periods": [], "daily_history": [], "category_mix": []}
+    performance = {"periods": [], "daily_history": [], "category_mix": [],
+                   "targets": {"daily_gallons": 0, "daily_qty": 0, "updated_at": "", "updated_by": ""}}
     try:
         with closing(connect()) as performance_connection:
             performance = production_performance_sql(performance_connection)
@@ -1394,7 +1425,8 @@ def dashboard_data():
             "package_types": package_type_data(), "packageable": packageable_rows,
             "inventory": [dict(x) for x in inventory], "shipped": [dict(x) for x in shipped],
             "shipping_inventory": [dict(x) for x in shipping_inventory], "stock_inventory": [dict(x) for x in stock_inventory],
-            "packaging_requirements": [dict(x) for x in requirements], "s_numbers": s_numbers,"stock_needs":stock_needs}
+            "packaging_requirements": [dict(x) for x in requirements], "s_numbers": s_numbers,"stock_needs":stock_needs,
+            "targets": performance["targets"]}
 
 
 def s_number_detail(s_number):
@@ -1529,6 +1561,7 @@ def admin_data():
         requirements = con.execute("""SELECT r.*,o.unit,COALESCE((SELECT SUM(k.package_count) FROM packaging k
           WHERE k.order_id=r.order_id AND k.package_type=r.package_type),0) completed_count
           FROM packaging_requirements r JOIN orders o ON o.id=r.order_id ORDER BY r.s_number,r.brand,r.color""").fetchall()
+        target = con.execute("SELECT daily_gallons,daily_qty,updated_at,updated_by FROM production_targets WHERE id=1").fetchone()
         order_rows = [dict(x) for x in orders]
         for order in order_rows:
             order["recipient_ids"] = [x[0] for x in con.execute("SELECT contact_id FROM order_recipients WHERE order_id=?", (order["id"],)).fetchall()]
@@ -1536,7 +1569,7 @@ def admin_data():
             "catalog": [dict(x) for x in catalog], "contacts": [dict(x) for x in contacts],
             "packaging": [dict(x) for x in packaging], "shipments": [dict(x) for x in shipments],
             "stock_packaging": [dict(x) for x in stock_packaging], "packaging_requirements": [dict(x) for x in requirements],
-            "package_types": package_type_data()}
+            "package_types": package_type_data(), "targets": dict(target) if target else {"daily_gallons": 0, "daily_qty": 0}}
 
 
 def contact_data():
@@ -2095,6 +2128,21 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(200); self.send_header("Content-Type", "application/json")
                 self.send_header("Set-Cookie", self.session_cookie())
                 self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data); return
+            if path == "/api/targets":
+                user = self.require_role("admin")
+                if not user: return
+                daily_gallons = float(payload.get("daily_gallons", 0)); daily_qty = float(payload.get("daily_qty", 0))
+                if daily_gallons < 0 or daily_qty < 0 or daily_gallons > 1000000000 or daily_qty > 1000000000:
+                    raise ValueError("Targets must be zero or a positive number below one billion.")
+                actor = user.get("display_name") or user.get("email") or user.get("username", "")
+                now = datetime.now().isoformat(timespec="seconds")
+                with closing(connect()) as con:
+                    con.execute("""INSERT INTO production_targets(id,daily_gallons,daily_qty,updated_at,updated_by)
+                      VALUES(1,?,?,?,?) ON CONFLICT(id) DO UPDATE SET daily_gallons=excluded.daily_gallons,
+                      daily_qty=excluded.daily_qty,updated_at=excluded.updated_at,updated_by=excluded.updated_by""",
+                      (round(daily_gallons,2),round(daily_qty,2),now,actor))
+                    con.commit()
+                return self.send_json({"ok": True, "daily_gallons": round(daily_gallons,2), "daily_qty": round(daily_qty,2)})
             if path == "/api/users":
                 if not self.require_role("admin"): return
                 email = str(payload.get("email", payload.get("username", ""))).strip().lower(); display_name = str(payload.get("display_name", "")).strip()
