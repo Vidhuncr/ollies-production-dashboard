@@ -457,6 +457,11 @@ try:
     summary_fast, _ = ok("GET", "/api/dashboard-summary", token=admin)
     assert set(tv_fast) == {"performance", "order_schedule"}
     assert "active_inventory_packages" in summary_fast and "inventory" not in summary_fast
+    active_lines = summary_fast["active_orders"]
+    assert [x["ship_month"] or "9999-99" for x in active_lines] == sorted(x["ship_month"] or "9999-99" for x in active_lines)
+    bulk_line = next(x for x in active_lines if x["id"] == bulk_order_id)
+    assert bulk_line["produced"] == 10 and bulk_line["package_count"] == 2
+    assert not any(x["s_number"] == "S10001" for x in active_lines)
     assert call("GET", "/api/dashboard-summary")[0] == 401
 
     for route in ("/", "/entry", "/production", "/inventory", "/shipping", "/costing", "/reporting", "/admin", "/tv"):
@@ -471,6 +476,8 @@ try:
     assert b"Orders by Ship Month" in production_page and b'type="month"' in production_page
     assert b"PO# optional" in production_page and b"showOrderDetail" in dashboard_page and b"Active Orders by PO#" in dashboard_page
     assert b"buildPOGroups" in dashboard_page and b"showPOGroup" in dashboard_page and b"/api/dashboard-summary" in dashboard_page and b"Packaging Requirements" in dashboard_page
+    assert b'orderSummaryMonth' in dashboard_page and b'orderSummaryProduced' in dashboard_page
+    assert b'<th>Category</th><th>Color</th><th>Batch #' in call("GET", "/admin", token=admin)[1]
     assert b"Grouped by PO#" in reporting_page and b"This Month" in reporting_page and b'<option value="category">Category</option>' in reporting_page
     for route in ("/api/reports/category.csv", "/api/reports/labor.csv"):
         assert call("GET", route, token=admin)[0] == 200, route

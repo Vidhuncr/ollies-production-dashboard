@@ -1690,9 +1690,12 @@ def dashboard_summary_data():
           WHERE produced_at>=? AND produced_at<? GROUP BY brand,color,unit ORDER BY gallons DESC""", (today,tomorrow)).fetchall()]
         total = [dict(x) for x in con.execute("""SELECT brand,color,unit,ROUND(SUM(gallons-bulk_allocated),2) gallons FROM production
           GROUP BY brand,color,unit ORDER BY gallons DESC""").fetchall()]
-        active_orders = [dict(x) for x in con.execute("""SELECT o.id,o.s_number,o.po_number,o.brand,o.color,o.gallons,o.unit,o.ship_month,o.created_at
+        active_orders = [dict(x) for x in con.execute("""SELECT o.id,o.s_number,o.po_number,o.brand,o.color,o.gallons,o.unit,o.ship_month,o.created_at,
+          ROUND(COALESCE((SELECT SUM(p.gallons) FROM production p WHERE p.order_id=o.id),0),2) produced,
+          COALESCE((SELECT SUM(k.package_count-COALESCE((SELECT SUM(h.package_count) FROM shipments h WHERE h.packaging_id=k.id),0))
+            FROM packaging k WHERE k.order_id=o.id),0) package_count
           FROM orders o LEFT JOIN s_number_status s ON s.s_number=o.s_number
-          WHERE s.shipped_at IS NULL ORDER BY o.s_number,o.brand,o.color,o.id""").fetchall()]
+          WHERE s.shipped_at IS NULL ORDER BY CASE WHEN o.ship_month='' THEN 1 ELSE 0 END,o.ship_month,o.s_number,o.id""").fetchall()]
         statuses = con.execute("""SELECT DISTINCT o.s_number,s.done_at,s.done_by,s.ready_at,s.ready_by,s.shipped_at,s.shipped_by
           FROM orders o LEFT JOIN s_number_status s ON s.s_number=o.s_number WHERE s.shipped_at IS NULL ORDER BY o.s_number""").fetchall()
         remaining_by_s = {}
