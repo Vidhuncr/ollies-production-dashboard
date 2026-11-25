@@ -123,7 +123,8 @@ try:
     bulk_result, _ = ok("POST", "/api/bulk-production", {"purpose": "orders", "brand": "Bulk Test", "color": "Green",
         "batch_number": "BULK-QC-1", "gallons": 10, "incubation_hours": 1, "rate_id": rate_id, "labor_hours": 0.5}, team, 201)
     dashboard, _ = ok("GET", "/api/dashboard", token=manager)
-    assert next(x for x in dashboard["bulk_demand"] if x["brand"] == "Bulk Test")["remaining"] == 0
+    pending = next(x for x in dashboard["bulk_demand"] if x["brand"] == "Bulk Test")
+    assert pending["remaining"] == 10 and pending["available_to_start"] == 0
     assert not any(x.get("batch_number") == "BULK-QC-1" for x in dashboard["packageable"])
     assert call("POST", "/api/bulk-production", {"purpose": "orders", "brand": "Bulk Test", "color": "Green",
         "batch_number": "BULK-TOO-MUCH", "gallons": 1, "incubation_hours": 0, "rate_id": rate_id, "labor_hours": 0.1}, team)[0] == 400
@@ -133,6 +134,7 @@ try:
         con.execute("UPDATE production SET incubation_due_at='2000-01-01T00:00:00' WHERE id=?", (bulk_result["id"],)); con.commit()
     ok("POST", f"/api/bulk-production/{bulk_result['id']}/quality", {"decision": "ready", "notes": "Passed QC"}, manager)
     dashboard, _ = ok("GET", "/api/dashboard", token=manager)
+    assert next(x for x in dashboard["bulk_demand"] if x["brand"] == "Bulk Test")["remaining"] == 0
     bulk_source = next(x for x in dashboard["packageable"] if x.get("batch_number") == "BULK-QC-1")
     ok("POST", "/api/packaging-requirements", {"order_id": bulk_order_id, "package_type": "5_gallon_pail", "required_count": 2}, team, 201)
     ok("POST", "/api/packaging", {"source_type": "stock", "source_id": bulk_source["source_id"], "package_type": "5_gallon_pail",
@@ -140,12 +142,17 @@ try:
     dashboard, _ = ok("GET", "/api/dashboard", token=manager)
     packaged_bulk = next(x for x in dashboard["stock_inventory"] if x["batch_number"] == "BULK-QC-1")
     ok("POST", "/api/inventory/assign", {"stock_packaging_id": packaged_bulk["id"], "order_id": bulk_order_id, "package_count": 2}, manager, 201)
+    dashboard, _ = ok("GET", "/api/dashboard", token=manager)
+    assert next(x for x in dashboard["incubation_batches"] if x["id"] == bulk_result["id"])["bulk_allocated"] == 10
+    assert next(x for x in dashboard["total"] if x["brand"] == "Bulk Test")["gallons"] == 10
+    assert call("POST", f"/api/bulk-production/{bulk_result['id']}/quality", {"decision": "trash"}, manager)[0] == 400
 
     trash_order, _ = ok("POST", "/api/orders", {"s_number": "S10997", "brand": "Bulk Test", "color": "Green",
         "gallons": 5, "ship_month": "2027-04"}, team, 201)
     trash_batch, _ = ok("POST", "/api/bulk-production", {"purpose": "orders", "brand": "Bulk Test", "color": "Green",
         "batch_number": "BULK-TRASH-1", "gallons": 5, "incubation_hours": 0, "rate_id": rate_id, "labor_hours": 0.2}, team, 201)
-    ok("POST", f"/api/bulk-production/{trash_batch['id']}/quality", {"decision": "trash", "notes": "Failed test"}, manager)
+    ok("POST", f"/api/bulk-production/{trash_batch['id']}/quality", {"decision": "trash", "notes": "Failed test",
+       "rate_id":rate_id,"labor_hours":0.25}, manager)
     dashboard, _ = ok("GET", "/api/dashboard", token=manager)
     assert next(x for x in dashboard["bulk_demand"] if x["brand"] == "Bulk Test")["remaining"] == 5
     assert not any(x.get("batch_number") == "BULK-TRASH-1" for x in dashboard["packageable"])
@@ -158,15 +165,40 @@ try:
     ok("POST", f"/api/bulk-production/{reworked['id']}/quality", {"decision": "ready", "notes": "Rework passed"}, manager)
     dashboard, _ = ok("GET", "/api/dashboard", token=manager)
     assert any(x.get("batch_number") == "BULK-REWORK-2" for x in dashboard["packageable"])
+    costs = {x["batch_number"]:x for x in ok("GET", "/api/costing", token=manager)[0]["stock_summary"]}
+    assert costs["BULK-TRASH-1"]["quality_status"] == "trash" and costs["BULK-TRASH-1"]["labor_cost"] == 9
+    assert costs["BULK-REWORK-1"]["labor_cost"] == 4 and costs["BULK-REWORK-2"]["labor_cost"] == 4
+    assert costs["BULK-REWORK-2"]["rework_of_batch"] == "BULK-REWORK-1"
+    assert call("POST", f"/api/bulk-production/{rework_source['id']}/quality", {"decision":"ready"}, manager)[0] == 400
 
     ok("POST", "/api/stock-needs", {"brand": "Bulk Test", "color": "Green", "amount": 3, "note": "QC stock test"}, team, 201)
     stock_qc, _ = ok("POST", "/api/bulk-production", {"purpose": "stock", "brand": "Bulk Test", "color": "Green",
         "batch_number": "BULK-STOCK-QC", "gallons": 3, "incubation_hours": 0, "rate_id": rate_id, "labor_hours": 0.1}, team, 201)
     dashboard, _ = ok("GET", "/api/dashboard", token=manager)
+    assert next(x for x in dashboard["stock_needs"] if x["note"] == "QC stock test")["remaining"] == 3
+    ok("POST", f"/api/bulk-production/{stock_qc['id']}/quality", {"decision": "ready"}, manager)
+    dashboard, _ = ok("GET", "/api/dashboard", token=manager)
     assert next(x for x in dashboard["stock_needs"] if x["note"] == "QC stock test")["remaining"] == 0
     ok("POST", f"/api/bulk-production/{stock_qc['id']}/quality", {"decision": "trash", "notes": "Damaged"}, manager)
     dashboard, _ = ok("GET", "/api/dashboard", token=manager)
     assert next(x for x in dashboard["stock_needs"] if x["note"] == "QC stock test")["remaining"] == 3
+
+    legacy_order = ok("POST", "/api/orders", {"s_number":"S10996","brand":"Bulk Test","color":"Green",
+        "gallons":8,"ship_month":"2027-04"}, team, 201)[0]
+    ok("POST", "/api/production", {"order_id":legacy_order["id"],"batch_number":"LEGACY-QC-1",
+       "gallons":2,"rate_id":rate_id,"labor_hours":.5}, team, 201)
+    legacy = ok("GET", "/api/bulk-production/legacy?q=LEGACY-QC", token=manager)[0][0]
+    assert legacy["s_number"] == "S10996"
+    assert call("POST", f"/api/bulk-production/{legacy['id']}/incubate", {"incubation_hours":0}, team)[0] == 403
+    ok("POST", f"/api/bulk-production/{legacy['id']}/incubate", {"incubation_hours":0}, manager)
+    def bulk_need():
+        return next(x for x in ok("GET", "/api/dashboard", token=manager)[0]["bulk_demand"] if x["brand"]=="Bulk Test")["remaining"]
+    assert bulk_need() == 8
+    ok("POST", f"/api/bulk-production/{legacy['id']}/quality", {"decision":"ready"}, manager)
+    assert bulk_need() == 6
+    ok("POST", f"/api/bulk-production/{legacy['id']}/quality", {"decision":"incubating","incubation_hours":0}, manager)
+    assert bulk_need() == 8
+    assert next(x for x in ok("GET","/api/costing",token=manager)[0]["stock_summary"] if x["batch_number"]=="LEGACY-QC-1")["labor_cost"] == 10
 
     multi_gal, _ = ok("POST", "/api/orders", {"s_number": "S10999", "po_number": "PO-TEST-10999", "brand": "Paint", "color": "Blue", "gallons": 2, "ship_month": "2027-04", "recipient_ids": [order_contact["id"]]}, team, 201)
     assert multi_gal["po_number"] == "PO-TEST-10999" and "disabled" in multi_gal["email_status"].lower()

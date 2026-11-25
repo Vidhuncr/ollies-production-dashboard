@@ -17,7 +17,8 @@ import time
 import traceback
 import webbrowser
 from contextlib import closing
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from math import isfinite
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -635,6 +636,7 @@ CREATE TABLE IF NOT EXISTS production (
   quality_decided_by TEXT NOT NULL DEFAULT '',
   quality_notes TEXT NOT NULL DEFAULT '',
   bulk_purpose TEXT NOT NULL DEFAULT '',
+  bulk_allocated NUMERIC NOT NULL DEFAULT 0,
   rework_of_id BIGINT REFERENCES production(id)
 );
 ALTER TABLE production ADD COLUMN IF NOT EXISTS quality_status TEXT NOT NULL DEFAULT 'ready';
@@ -644,6 +646,7 @@ ALTER TABLE production ADD COLUMN IF NOT EXISTS quality_decided_at TEXT NOT NULL
 ALTER TABLE production ADD COLUMN IF NOT EXISTS quality_decided_by TEXT NOT NULL DEFAULT '';
 ALTER TABLE production ADD COLUMN IF NOT EXISTS quality_notes TEXT NOT NULL DEFAULT '';
 ALTER TABLE production ADD COLUMN IF NOT EXISTS bulk_purpose TEXT NOT NULL DEFAULT '';
+ALTER TABLE production ADD COLUMN IF NOT EXISTS bulk_allocated NUMERIC NOT NULL DEFAULT 0;
 ALTER TABLE production ADD COLUMN IF NOT EXISTS rework_of_id BIGINT REFERENCES production(id);
 CREATE TABLE IF NOT EXISTS catalog (
   id BIGSERIAL PRIMARY KEY,
@@ -845,6 +848,7 @@ def initialize_supabase():
         for statement in SUPABASE_SCHEMA.split(";"):
             if statement.strip():
                 con.execute(statement)
+        remove_provisional_stock_credit_sql(con)
         if not con.execute("SELECT 1 FROM users WHERE role='admin' AND active=1").fetchone():
             seed_email = APP_ADMIN_EMAIL if valid_email(APP_ADMIN_EMAIL) else (APP_USERNAME.lower() if valid_email(APP_USERNAME) else "")
             seed_username = seed_email or APP_USERNAME
@@ -1167,12 +1171,21 @@ def initialize():
             ("quality_decided_by", "TEXT NOT NULL DEFAULT ''"),
             ("quality_notes", "TEXT NOT NULL DEFAULT ''"),
             ("bulk_purpose", "TEXT NOT NULL DEFAULT ''"),
+            ("bulk_allocated", "REAL NOT NULL DEFAULT 0"),
             ("rework_of_id", "INTEGER REFERENCES production(id)"),
         ):
             if column not in production_columns:
                 con.execute(f"ALTER TABLE production ADD COLUMN {column} {definition}")
         con.execute("CREATE INDEX IF NOT EXISTS idx_production_quality ON production(quality_status,incubation_due_at)")
+        remove_provisional_stock_credit_sql(con)
         con.commit()
+
+
+def remove_provisional_stock_credit_sql(con):
+    # Earlier versions recorded credits when incubation started. Clear only
+    # those derived credits; production, QC, and labor records stay in place.
+    con.execute("""DELETE FROM stock_need_fulfillments WHERE production_id IN
+      (SELECT id FROM production WHERE bulk_purpose='stock' AND quality_status='incubating')""")
 
 
 def refresh_s_number_shipped(con, s_number):
@@ -1220,8 +1233,8 @@ def stock_need_rows_sql(con):
       n.created_at,n.id""").fetchall()]
 
 
-def bulk_demand_rows_sql(con):
-    """Open customer-order demand after category-level bulk batches reserve product."""
+def bulk_demand_rows_sql(con, purpose="orders"):
+    """Report unmet need separately from the balance available to start mixing."""
     order_need = {
         (row["brand"], row["color"], row["unit"]): float(row["amount"])
         for row in con.execute("""SELECT brand,color,unit,ROUND(SUM(remaining),2) amount FROM (
@@ -1233,18 +1246,27 @@ def bulk_demand_rows_sql(con):
           WHERE s.shipped_at IS NULL GROUP BY o.id
         ) GROUP BY brand,color,unit""").fetchall()
     }
-    reserved = {
-        (row["brand"], row["color"], row["unit"]): float(row["amount"])
-        for row in con.execute("""SELECT brand,color,unit,ROUND(SUM(gallons),2) amount
-          FROM production WHERE order_id IS NULL AND incubation_started_at<>'' AND bulk_purpose='orders'
-          AND quality_status IN ('incubating','ready') GROUP BY brand,color,unit""").fetchall()
-    }
+    if purpose == "stock":
+        order_need = {}
+        for row in stock_need_rows_sql(con):
+            key = (row["brand"], row["color"], row["unit"])
+            order_need[key] = order_need.get(key, 0.0) + float(row["remaining"])
+    pipeline = {}
+    for row in con.execute("""SELECT brand,color,unit,quality_status,
+        ROUND(SUM(gallons-bulk_allocated),2) amount FROM production
+        WHERE order_id IS NULL AND bulk_purpose=? AND quality_status IN ('incubating','ready')
+        GROUP BY brand,color,unit,quality_status""", (purpose,)).fetchall():
+        pipeline.setdefault((row["brand"], row["color"], row["unit"]), {})[row["quality_status"]] = float(row["amount"])
     rows = []
     for key, required in order_need.items():
-        held = reserved.get(key, 0.0)
-        remaining = round(max(required-held, 0.0), 2)
+        states = pipeline.get(key, {})
+        held = states.get("incubating", 0.0)
+        # Released future stock is already reflected in stock_need_fulfillments.
+        released = states.get("ready", 0.0) if purpose == "orders" else 0.0
+        remaining = round(max(required-released, 0.0), 2)
         rows.append({"brand": key[0], "color": key[1], "unit": key[2],
-                     "order_need": round(required, 2), "bulk_reserved": round(held, 2),
+                     "order_need": round(required, 2), "bulk_reserved": round(held, 2), "qc_released": released,
+                     "available_to_start": round(max(remaining-held, 0.0), 2),
                      "gallons": remaining, "remaining": remaining})
     rows.sort(key=lambda row: float(row["remaining"]), reverse=True)
     return rows
@@ -1254,10 +1276,30 @@ def incubation_batches_sql(con):
     return [dict(row) for row in con.execute("""SELECT p.id,p.batch_number,p.brand,p.color,p.unit,p.gallons,
       p.produced_at,p.quality_status,p.incubation_started_at,p.incubation_due_at,p.quality_decided_at,
       p.quality_decided_by,p.quality_notes,p.bulk_purpose,p.rework_of_id,
-      ROUND(p.gallons-COALESCE((SELECT SUM(k.gallons) FROM stock_packaging k WHERE k.production_id=p.id),0),2) unpackaged
+      p.bulk_allocated,
+      ROUND(p.gallons-p.bulk_allocated-COALESCE((SELECT SUM(k.gallons) FROM stock_packaging k WHERE k.production_id=p.id),0),2) unpackaged,
+      (SELECT MIN(c.id) FROM production c WHERE c.rework_of_id=p.id) rework_child_id
       FROM production p WHERE p.order_id IS NULL AND p.incubation_started_at<>''
       ORDER BY CASE p.quality_status WHEN 'incubating' THEN 0 WHEN 'rework' THEN 1 WHEN 'ready' THEN 2 ELSE 3 END,
       p.produced_at DESC,p.id DESC LIMIT 250""").fetchall()]
+
+
+def eligible_legacy_batches_sql(con, search=""):
+    return [dict(row) for row in con.execute("""SELECT p.id,p.batch_number,p.brand,p.color,p.unit,p.gallons,o.s_number
+      FROM production p LEFT JOIN orders o ON o.id=p.order_id LEFT JOIN s_number_status s ON s.s_number=o.s_number
+      WHERE p.incubation_started_at='' AND lower(p.batch_number) LIKE ?
+        AND s.ready_at IS NULL AND s.done_at IS NULL AND s.shipped_at IS NULL
+        AND NOT EXISTS (SELECT 1 FROM stock_packaging k WHERE k.production_id=p.id)
+        AND NOT EXISTS (SELECT 1 FROM packaging k WHERE k.order_id=p.order_id)
+      ORDER BY p.produced_at DESC,p.id DESC LIMIT 100""", ("%"+search.lower()+"%",)).fetchall()]
+
+
+def incubation_times(payload):
+    hours = float(payload.get("incubation_hours", 24))
+    if not isfinite(hours) or not 0 <= hours <= 720:
+        raise ValueError("Incubation must be between 0 and 720 hours.")
+    started = datetime.now(timezone.utc)
+    return started.isoformat(timespec="seconds"), (started+timedelta(hours=hours)).isoformat(timespec="seconds")
 
 
 def allocate_stock_need_sql(con, production_id, brand, color, unit, amount):
@@ -1313,7 +1355,7 @@ def _period_metrics_sql(con, start="", end=""):
       "required_qty": 0.0, "packaged_gallons": 0.0, "packaged_qty": 0.0,
       "shipped_gallons": 0.0, "shipped_qty": 0.0, "labor_hours": 0.0,
       "labor_cost": 0.0, "batches": 0, "orders": 0, "packages": 0, "shipped_packages": 0}
-    for row in con.execute(f"SELECT unit,COALESCE(SUM(gallons),0) amount,COUNT(*) batches FROM production{production_where} GROUP BY unit", production_params).fetchall():
+    for row in con.execute(f"SELECT unit,COALESCE(SUM(gallons-bulk_allocated),0) amount,COUNT(*) batches FROM production{production_where} GROUP BY unit", production_params).fetchall():
         suffix = "qty" if row["unit"] == "qty" else "gallons"
         result[f"produced_{suffix}"] = round(float(row["amount"]), 2); result["batches"] += int(row["batches"])
     for row in con.execute(f"SELECT unit,COALESCE(SUM(gallons),0) amount,COUNT(*) orders FROM orders{order_where} GROUP BY unit", order_params).fetchall():
@@ -1367,7 +1409,7 @@ def _target_plan_sql(con, start, end, defaults):
 def _today_target_breakdown_sql(con, target_date, defaults):
     rows = [dict(x) for x in con.execute("""SELECT id,target_date,brand,color,unit,amount,updated_at,updated_by
       FROM daily_production_targets WHERE target_date=? AND amount>0 ORDER BY unit,brand,color,id""", (target_date,)).fetchall()]
-    actual_rows = con.execute("""SELECT brand,color,unit,ROUND(SUM(gallons),2) amount FROM production
+    actual_rows = con.execute("""SELECT brand,color,unit,ROUND(SUM(gallons-bulk_allocated),2) amount FROM production
       WHERE produced_at>=? AND produced_at<? GROUP BY brand,color,unit""",
       (target_date, (date.fromisoformat(target_date)+timedelta(days=1)).isoformat())).fetchall()
     actual = {(x["brand"],x["color"],x["unit"]): float(x["amount"]) for x in actual_rows}
@@ -1419,14 +1461,14 @@ def production_performance_sql(con):
           "target": {**(_target_plan_sql(con,start,end,defaults) if target_days else {"gallons": 0.0,"qty": 0.0}),
                      "days": target_days}})
     history_start = today_value - timedelta(days=13)
-    history_rows = con.execute("""SELECT substr(produced_at,1,10) AS production_day,unit,ROUND(SUM(gallons),2) amount
+    history_rows = con.execute("""SELECT substr(produced_at,1,10) AS production_day,unit,ROUND(SUM(gallons-bulk_allocated),2) amount
       FROM production WHERE produced_at>=? AND produced_at<? GROUP BY substr(produced_at,1,10),unit ORDER BY production_day""",
       (history_start.isoformat(), tomorrow_value.isoformat())).fetchall()
     by_day = {str(history_start+timedelta(days=offset)): {"day": str(history_start+timedelta(days=offset)), "gallons": 0.0, "qty": 0.0}
               for offset in range(14)}
     for row in history_rows:
         by_day[row["production_day"]]["qty" if row["unit"] == "qty" else "gallons"] = float(row["amount"])
-    mix = [dict(x) for x in con.execute("""SELECT brand,unit,ROUND(SUM(gallons),2) amount FROM production
+    mix = [dict(x) for x in con.execute("""SELECT brand,unit,ROUND(SUM(gallons-bulk_allocated),2) amount FROM production
       WHERE produced_at>=? AND produced_at<? GROUP BY brand,unit ORDER BY amount DESC""",
       ((today_value-timedelta(days=29)).isoformat(), tomorrow_value.isoformat())).fetchall()]
     today_targets = _target_plan_sql(con,today_value,tomorrow_value,defaults)
@@ -1450,11 +1492,11 @@ def dashboard_data():
         need = bulk_demand_rows_sql(con)
         stock_needs = stock_need_rows_sql(con)
         daily = con.execute("""
-          SELECT brand,color,unit,ROUND(SUM(gallons),2) gallons FROM production
+          SELECT brand,color,unit,ROUND(SUM(gallons-bulk_allocated),2) gallons FROM production
           WHERE produced_at>=? AND produced_at<? GROUP BY brand,color,unit ORDER BY gallons DESC
         """, (today,tomorrow)).fetchall()
         total = con.execute("""
-          SELECT brand,color,unit,ROUND(SUM(gallons),2) gallons FROM production
+          SELECT brand,color,unit,ROUND(SUM(gallons-bulk_allocated),2) gallons FROM production
           GROUP BY brand,color,unit ORDER BY gallons DESC
         """).fetchall()
         recent = con.execute("""
@@ -1507,7 +1549,7 @@ def dashboard_data():
         packageable_rows = [{**dict(x), "source_type": "order", "source_id": x["id"]} for x in packageable]
         stock_packageable = con.execute("""SELECT * FROM (SELECT p.id,p.brand,p.color,p.unit,p.batch_number,p.bulk_purpose,p.quality_status,
           ROUND(p.gallons,2) produced,ROUND(COALESCE((SELECT SUM(k.gallons) FROM stock_packaging k WHERE k.production_id=p.id),0),2) packaged,
-          ROUND(p.gallons-COALESCE((SELECT SUM(k.gallons) FROM stock_packaging k WHERE k.production_id=p.id),0),2) available
+          ROUND(p.gallons-p.bulk_allocated-COALESCE((SELECT SUM(k.gallons) FROM stock_packaging k WHERE k.production_id=p.id),0),2) available
            FROM production p WHERE p.order_id IS NULL AND (p.incubation_started_at='' OR p.quality_status='ready'))
            WHERE available>0.0001 ORDER BY brand,color,id""").fetchall()
         packageable_rows.extend([{**dict(x), "s_number": "STOCK", "source_type": "stock", "source_id": x["id"]} for x in stock_packageable])
@@ -1578,6 +1620,7 @@ def dashboard_data():
                               "package_count": int(packed["package_count"]) if packed else 0,
                               "packaged_gallons": round(float(packed["packaged_gallons"]),2) if packed else 0})
         bulk_demand = [dict(x) for x in need]
+        bulk_stock_demand = bulk_demand_rows_sql(con, "stock")
         incubation_batches = incubation_batches_sql(con)
     performance = {"periods": [], "daily_history": [], "category_mix": [],
                    "targets": {"daily_gallons": 0, "daily_qty": 0, "updated_at": "", "updated_by": ""}}
@@ -1603,7 +1646,8 @@ def dashboard_data():
             "inventory": [dict(x) for x in inventory], "shipped": [dict(x) for x in shipped],
             "shipping_inventory": [dict(x) for x in shipping_inventory], "stock_inventory": [dict(x) for x in stock_inventory],
             "packaging_requirements": [dict(x) for x in requirements], "s_numbers": s_numbers,"stock_needs":stock_needs,
-            "bulk_demand": bulk_demand, "incubation_batches": incubation_batches,
+            "bulk_demand": bulk_demand, "bulk_stock_demand": bulk_stock_demand,
+            "incubation_batches": incubation_batches,
             "targets": performance["targets"]}
 
 
@@ -1642,9 +1686,9 @@ def dashboard_summary_data():
             if existing: existing["gallons"] = round(float(existing["gallons"])+float(item["remaining"]),2)
             else: need.append({"brand":item["brand"],"color":item["color"],"unit":item["unit"],"gallons":item["remaining"]})
         need.sort(key=lambda x:float(x["gallons"]),reverse=True)
-        daily = [dict(x) for x in con.execute("""SELECT brand,color,unit,ROUND(SUM(gallons),2) gallons FROM production
+        daily = [dict(x) for x in con.execute("""SELECT brand,color,unit,ROUND(SUM(gallons-bulk_allocated),2) gallons FROM production
           WHERE produced_at>=? AND produced_at<? GROUP BY brand,color,unit ORDER BY gallons DESC""", (today,tomorrow)).fetchall()]
-        total = [dict(x) for x in con.execute("""SELECT brand,color,unit,ROUND(SUM(gallons),2) gallons FROM production
+        total = [dict(x) for x in con.execute("""SELECT brand,color,unit,ROUND(SUM(gallons-bulk_allocated),2) gallons FROM production
           GROUP BY brand,color,unit ORDER BY gallons DESC""").fetchall()]
         active_orders = [dict(x) for x in con.execute("""SELECT o.id,o.s_number,o.po_number,o.brand,o.color,o.gallons,o.unit,o.ship_month,o.created_at
           FROM orders o LEFT JOIN s_number_status s ON s.s_number=o.s_number
@@ -1930,19 +1974,21 @@ def catalog_data():
 
 
 def category_report_rows():
-    data = admin_data(); stock_needs = dashboard_data().get("stock_needs", []); totals = {}
+    totals = {}
     def row(category, unit):
         return totals.setdefault((category, unit), {"category": category, "unit": unit,
           "ordered": 0.0, "produced": 0.0, "need": 0.0})
-    for item in data["catalog"]: row(item["category"], item.get("unit", "gallons"))
-    for order in data["orders"]:
-        item = row(order["brand"], order.get("unit", "gallons"))
-        item["ordered"] += float(order["gallons"]); item["need"] += max(float(order["remaining"]), 0)
-    for need in stock_needs:
-        item = row(need["brand"], need.get("unit", "gallons"))
-        item["ordered"] += float(need["amount"]); item["need"] += max(float(need["remaining"]), 0)
-    for batch in data["batches"]:
-        row(batch["brand"], batch.get("unit", "gallons"))["produced"] += float(batch["gallons"])
+    with closing(connect()) as con:
+        for item in con.execute("SELECT DISTINCT category,unit FROM catalog").fetchall(): row(item["category"], item["unit"])
+        for item in con.execute("SELECT brand,unit,SUM(gallons) amount FROM orders GROUP BY brand,unit").fetchall():
+            row(item["brand"],item["unit"])["ordered"] += float(item["amount"])
+        for item in bulk_demand_rows_sql(con):
+            row(item["brand"],item["unit"])["need"] += item["remaining"]
+        for need in stock_need_rows_sql(con):
+            item = row(need["brand"],need["unit"])
+            item["ordered"] += float(need["amount"]); item["need"] += float(need["remaining"])
+        for item in con.execute("SELECT brand,unit,SUM(gallons-bulk_allocated) amount FROM production GROUP BY brand,unit").fetchall():
+            row(item["brand"],item["unit"])["produced"] += float(item["amount"])
     return [{**x, "ordered": round(x["ordered"],2), "produced": round(x["produced"],2), "need": round(x["need"],2)}
             for x in sorted(totals.values(), key=lambda x: (x["category"].lower(), x["unit"]))]
 
@@ -1974,11 +2020,13 @@ def costing_data():
             THEN COALESCE((SELECT SUM(e.labor_cost) FROM labor_entries e WHERE e.order_id=o.id),0)/
                  (SELECT SUM(p.gallons) FROM production p WHERE p.order_id=o.id) ELSE 0 END,4) cost_per_unit
           FROM orders o ORDER BY o.s_number,o.brand,o.color""").fetchall()]
-        stock_summary = [dict(x) for x in con.execute("""SELECT p.id production_id,p.batch_number,p.brand,p.color,p.unit,p.gallons produced_amount,
+        stock_summary = [dict(x) for x in con.execute("""SELECT p.id production_id,p.batch_number,p.brand,p.color,p.unit,
+          p.gallons-p.bulk_allocated produced_amount,p.quality_status,p.rework_of_id,parent.batch_number rework_of_batch,
           ROUND(COALESCE((SELECT SUM(e.hours) FROM labor_entries e WHERE e.order_id IS NULL AND e.production_id=p.id),0),2) labor_hours,
           ROUND(COALESCE((SELECT SUM(e.labor_cost) FROM labor_entries e WHERE e.order_id IS NULL AND e.production_id=p.id),0),2) labor_cost,
-          ROUND(CASE WHEN p.gallons>0 THEN COALESCE((SELECT SUM(e.labor_cost) FROM labor_entries e WHERE e.order_id IS NULL AND e.production_id=p.id),0)/p.gallons ELSE 0 END,4) cost_per_unit
-          FROM production p WHERE p.order_id IS NULL ORDER BY p.produced_at DESC,p.id DESC""").fetchall()]
+          ROUND(CASE WHEN p.gallons>p.bulk_allocated THEN COALESCE((SELECT SUM(e.labor_cost) FROM labor_entries e WHERE e.order_id IS NULL AND e.production_id=p.id),0)/(p.gallons-p.bulk_allocated) ELSE 0 END,4) cost_per_unit
+          FROM production p LEFT JOIN production parent ON parent.id=p.rework_of_id
+          WHERE p.order_id IS NULL ORDER BY p.produced_at DESC,p.id DESC""").fetchall()]
     combined = {}
     for row in summary:
         item=combined.setdefault(row["s_number"],{"s_number":row["s_number"],"labor_cost":0.0,"labor_hours":0.0,"produced_gallons":0.0,"produced_qty":0.0,"gallon_cost":0.0,"qty_cost":0.0})
@@ -1992,7 +2040,7 @@ def costing_data():
         item["labor_cost"]=round(item["labor_cost"],2); item["labor_hours"]=round(item["labor_hours"],2); s_summary.append(item)
     return {"orders": orders, "rates": rates, "current_rates": current_rates, "entries": entries, "summary": summary,
             "stock_summary":stock_summary,"s_summary":sorted(s_summary,key=lambda x:x["s_number"]),
-            "processes": ["Mixing / Production", "Quality Control", "Filling / Packaging", "Material Handling", "Shipping / Loading", "Other"]}
+            "processes": ["Mixing / Production", "Bulk Mixing / Production", "Batch Rework", "Quality Control", "Filling / Packaging", "Material Handling", "Shipping / Loading", "Other"]}
 
 
 def normalize_report_date(value):
@@ -2047,7 +2095,7 @@ def reporting_data(date_from="", date_to=""):
           s.ready_at,s.shipped_at FROM packaging_requirements r JOIN orders o ON o.id=r.order_id
           LEFT JOIN s_number_status s ON s.s_number=r.s_number ORDER BY r.s_number,r.brand,r.color,r.package_size DESC""").fetchall()]
         produced_totals = {x["unit"]: float(x["amount"]) for x in con.execute(
-          "SELECT unit,COALESCE(SUM(gallons),0) amount FROM production GROUP BY unit").fetchall()}
+          "SELECT unit,COALESCE(SUM(gallons-bulk_allocated),0) amount FROM production GROUP BY unit").fetchall()}
         stock_inventory = {x["unit"]: float(x["amount"]) for x in con.execute("""SELECT p.unit,COALESCE(SUM(k.gallons),0) amount
           FROM stock_packaging k JOIN production p ON p.id=k.production_id GROUP BY p.unit""").fetchall()}
         total_labor_cost = float(con.execute("SELECT COALESCE(SUM(labor_cost),0) FROM labor_entries").fetchone()[0])
@@ -2105,8 +2153,8 @@ def reporting_data(date_from="", date_to=""):
 
 def record_labor_sql(con, payload, order=None, production=None, process_name="Production", actor="System"):
     hours = float(payload.get("labor_hours",0) or 0); rate_id = int(payload.get("rate_id",0) or 0)
-    if hours <= 0 and not rate_id: return None
-    if hours <= 0 or not rate_id: raise ValueError("Select a labor rate and enter labor hours greater than zero.")
+    if hours == 0 and not rate_id: return None
+    if not isfinite(hours) or hours <= 0 or not rate_id: raise ValueError("Select a labor rate and enter labor hours greater than zero.")
     rate = con.execute("SELECT * FROM labor_rates WHERE id=? AND active=1",(rate_id,)).fetchone()
     if not rate: raise ValueError("The selected labor rate is unavailable.")
     source = order or production; cost = round(hours*float(rate["hourly_rate"]),2); worked_at = datetime.now().isoformat(timespec="seconds")
@@ -2141,11 +2189,12 @@ def labor_report_csv():
     for row in data["summary"]:
         writer.writerow([row["s_number"],row["brand"],row["color"],"piece" if row["unit"]=="qty" else "gallon",
                          row["ordered_amount"],row["produced_amount"],row["labor_hours"],row["labor_cost"],row["cost_per_unit"]])
-    writer.writerow([]); writer.writerow(["FUTURE STOCK COST"])
-    writer.writerow(["Batch", "Category", "Color", "Unit", "Produced Amount", "Labor Hours", "Labor Cost", "Labor Cost Per Produced Unit"])
+    writer.writerow([]); writer.writerow(["BULK AND STOCK BATCH COST"])
+    writer.writerow(["Batch", "Category", "Color", "Unit", "Unallocated Amount", "Labor Hours", "Labor Cost", "Labor Cost Per Unit", "QC Status", "Rework Of"])
     for row in data["stock_summary"]:
         writer.writerow([row["batch_number"],row["brand"],row["color"],"piece" if row["unit"]=="qty" else "gallon",
-                         row["produced_amount"],row["labor_hours"],row["labor_cost"],row["cost_per_unit"]])
+                         row["produced_amount"],row["labor_hours"],row["labor_cost"],row["cost_per_unit"],
+                         row["quality_status"],row["rework_of_batch"] or ""])
     return output.getvalue().encode("utf-8-sig")
 
 
@@ -2292,6 +2341,11 @@ class Handler(BaseHTTPRequestHandler):
             if not self.authorized(): return
             return self.send_json(cached_read("dashboard-summary", dashboard_summary_data, 5))
         if path == "/api/dashboard": return self.send_json(cached_dashboard_data())
+        if path == "/api/bulk-production/legacy":
+            if not self.require_role("edit"): return
+            search = parse_qs(urlparse(self.path).query).get("q", [""])[0][:100]
+            with closing(connect()) as con:
+                return self.send_json(eligible_legacy_batches_sql(con, search))
         detail_match = re.fullmatch(r"/api/s-numbers/([^/]+)/detail", path)
         if detail_match:
             if not self.authorized(): return
@@ -2520,9 +2574,13 @@ class Handler(BaseHTTPRequestHandler):
                 if raw_count != package_count or package_count <= 0: raise ValueError("Transfer quantity must be a whole number greater than zero.")
                 actor = user.get("display_name") or user.get("email") or user.get("username", "")
                 with closing(connect()) as con:
-                    stock = con.execute("""SELECT k.*,p.batch_number,p.gallons production_gallons,p.unit FROM stock_packaging k
+                    lock_bulk_production_sql(con)
+                    if USE_SUPABASE: lock_order_sql(con,order_id)
+                    stock = con.execute("""SELECT k.*,p.batch_number,p.gallons-p.bulk_allocated production_gallons,p.unit,
+                      p.bulk_purpose,p.produced_at,p.quality_status FROM stock_packaging k
                       JOIN production p ON p.id=k.production_id WHERE k.id=?""", (stock_packaging_id,)).fetchone()
                     if not stock: raise ValueError("Stock package record was not found.")
+                    if stock["quality_status"] != "ready": raise ValueError("Only QC-released stock can be allocated.")
                     if package_count > stock["package_count"]: raise ValueError(f"Only {stock['package_count']} package(s) are available in stock.")
                     order = con.execute("""SELECT o.*,s.done_at,s.shipped_at,o.gallons-
                       COALESCE((SELECT SUM(p.gallons) FROM production p WHERE p.order_id=o.id),0) remaining
@@ -2534,9 +2592,10 @@ class Handler(BaseHTTPRequestHandler):
                     assigned_gallons = round(stock["package_size"]*package_count,2)
                     if assigned_gallons > order["remaining"] + .0001:
                         raise ValueError(f"The target order needs only {order['remaining']:.2f} gallons; this transfer is {assigned_gallons:.2f} gallons.")
-                    allocation_batch = f"{stock['batch_number']}-S{order_id}-A{stock_packaging_id}-{int(time.time())}"
+                    allocation_batch = f"{stock['batch_number']}-S{order_id}-A{stock_packaging_id}-{time.time_ns()}"
                     cur=con.execute("INSERT INTO production(order_id,brand,color,unit,batch_number,gallons,produced_at) VALUES(?,?,?,?,?,?,?)",
-                                (order_id,stock["brand"],stock["color"],stock["unit"],allocation_batch,assigned_gallons,datetime.now().isoformat(timespec="seconds")))
+                                 (order_id,stock["brand"],stock["color"],stock["unit"],allocation_batch,assigned_gallons,
+                                  stock["produced_at"] if stock["bulk_purpose"] else datetime.now().isoformat(timespec="seconds")))
                     assigned_production_id=cur.lastrowid
                     con.execute("""INSERT INTO packaging(order_id,s_number,brand,color,package_type,package_size,package_count,gallons,packaged_at,created_by)
                       VALUES(?,?,?,?,?,?,?,?,?,?)""", (order_id,order["s_number"],stock["brand"],stock["color"],stock["package_type"],
@@ -2548,7 +2607,9 @@ class Handler(BaseHTTPRequestHandler):
                     else: con.execute("DELETE FROM stock_packaging WHERE id=?", (stock_packaging_id,))
                     release_stock_need_sql(con,stock["production_id"],assigned_gallons)
                     allocate_stock_labor_sql(con,stock["production_id"],order,assigned_production_id,assigned_gallons/float(stock["production_gallons"]),actor)
-                    if remaining_gallons > .0001: con.execute("UPDATE production SET gallons=? WHERE id=?", (remaining_gallons,stock["production_id"]))
+                    if stock["bulk_purpose"]:
+                        con.execute("UPDATE production SET bulk_allocated=bulk_allocated+? WHERE id=?", (assigned_gallons,stock["production_id"]))
+                    elif remaining_gallons > .0001: con.execute("UPDATE production SET gallons=? WHERE id=?", (remaining_gallons,stock["production_id"]))
                     else: con.execute("DELETE FROM production WHERE id=?", (stock["production_id"],))
                     refresh_s_number_ready(con,order["s_number"],actor)
                     con.commit()
@@ -2563,9 +2624,13 @@ class Handler(BaseHTTPRequestHandler):
                 if not batch: raise ValueError("Enter a batch number for the tinted and relabeled product.")
                 actor = user.get("display_name") or user.get("email") or user.get("username", "")
                 with closing(connect()) as con:
-                    stock = con.execute("""SELECT k.*,p.batch_number source_batch,p.gallons production_gallons,p.unit
+                    lock_bulk_production_sql(con)
+                    if USE_SUPABASE: lock_order_sql(con,order_id)
+                    stock = con.execute("""SELECT k.*,p.batch_number source_batch,p.gallons-p.bulk_allocated production_gallons,p.unit,
+                      p.bulk_purpose,p.quality_status
                       FROM stock_packaging k JOIN production p ON p.id=k.production_id WHERE k.id=?""", (stock_packaging_id,)).fetchone()
                     if not stock: raise ValueError("Packaged source material was not found.")
+                    if stock["quality_status"] != "ready": raise ValueError("Only QC-released stock can be used.")
                     if package_count > stock["package_count"]: raise ValueError(f"Only {stock['package_count']} package(s) are available in this source stock.")
                     order = con.execute("""SELECT o.*,s.done_at,s.shipped_at,o.gallons-
                       COALESCE((SELECT SUM(p.gallons) FROM production p WHERE p.order_id=o.id),0) remaining
@@ -2603,7 +2668,9 @@ class Handler(BaseHTTPRequestHandler):
                     labor_payload["labor_notes"] = (source_note + (" | " + str(payload.get("labor_notes","")).strip() if str(payload.get("labor_notes","")).strip() else ""))
                     labor_cost = record_labor_sql(con,labor_payload,order=order,production={"id":production_id},
                                                   process_name="Tint / Relabel / New Lid",actor=actor)
-                    if remaining_source > .0001: con.execute("UPDATE production SET gallons=? WHERE id=?",(remaining_source,stock["production_id"]))
+                    if stock["bulk_purpose"]:
+                        con.execute("UPDATE production SET bulk_allocated=bulk_allocated+? WHERE id=?", (converted,stock["production_id"]))
+                    elif remaining_source > .0001: con.execute("UPDATE production SET gallons=? WHERE id=?",(remaining_source,stock["production_id"]))
                     else: con.execute("DELETE FROM production WHERE id=?",(stock["production_id"],))
                     refresh_s_number_ready(con,order["s_number"],actor); con.commit()
                     remaining_after = round(float(order["remaining"])-converted,2)
@@ -2703,6 +2770,34 @@ class Handler(BaseHTTPRequestHandler):
                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(order_id,order["s_number"],order["brand"],order["color"],order["unit"],process_name,rate["labor_name"],
                       hours,rate["hourly_rate"],cost,worked_at,notes,datetime.now().isoformat(timespec="seconds"),actor)); con.commit()
                 return self.send_json({"ok":True,"labor_cost":cost},201)
+            legacy_match = re.fullmatch(r"/api/bulk-production/(\d+)/incubate", path)
+            if legacy_match:
+                user = self.require_role("edit")
+                if not user: return
+                production_id = int(legacy_match.group(1))
+                started, due = incubation_times(payload)
+                with closing(connect()) as con:
+                    lock_bulk_production_sql(con)
+                    old = con.execute("SELECT * FROM production WHERE id=?", (production_id,)).fetchone()
+                    if not old or old["incubation_started_at"]:
+                        raise ValueError("Select an older batch that has not already entered QC.")
+                    if USE_SUPABASE:
+                        if old["order_id"] is not None: lock_order_sql(con, old["order_id"])
+                        lock_production_sql(con, production_id)
+                    if con.execute("SELECT 1 FROM stock_packaging WHERE production_id=?", (production_id,)).fetchone():
+                        raise ValueError("An already packaged batch cannot be moved to incubation.")
+                    if old["order_id"] is not None:
+                        order = con.execute("""SELECT o.s_number,s.done_at,s.ready_at,s.shipped_at FROM orders o
+                          LEFT JOIN s_number_status s ON s.s_number=o.s_number WHERE o.id=?""", (old["order_id"],)).fetchone()
+                        if not order or any(order[k] for k in ("done_at","ready_at","shipped_at")) or con.execute(
+                            "SELECT 1 FROM packaging WHERE order_id=?", (old["order_id"],)).fetchone():
+                            raise ValueError("This order already has packaging or is closed; its batch cannot be moved.")
+                        con.execute("UPDATE labor_entries SET order_id=NULL,s_number='STOCK' WHERE production_id=?", (production_id,))
+                    release_stock_need_sql(con, production_id, float(old["gallons"]))
+                    con.execute("""UPDATE production SET order_id=NULL,bulk_purpose='orders',quality_status='incubating',
+                        incubation_started_at=?,incubation_due_at=? WHERE id=?""", (started,due,production_id))
+                    con.commit()
+                return self.send_json({"ok":True,"quality_status":"incubating","incubation_due_at":due})
             quality_match = re.fullmatch(r"/api/bulk-production/(\d+)/quality", path)
             if quality_match:
                 user = self.require_role("edit")
@@ -2710,25 +2805,40 @@ class Handler(BaseHTTPRequestHandler):
                 production_id = int(quality_match.group(1))
                 decision = str(payload.get("decision", "")).strip().lower()
                 notes = str(payload.get("notes", "")).strip()
-                if decision not in ("ready", "rework", "trash"):
-                    raise ValueError("Choose Ready for Packaging, Needs Rework, or Trash.")
+                if decision not in ("incubating", "ready", "rework", "trash"):
+                    raise ValueError("Select a valid QC status.")
                 actor = user.get("display_name") or user.get("email") or user.get("username", "")
                 with closing(connect()) as con:
-                    lock_production_sql(con, production_id)
+                    lock_bulk_production_sql(con)
+                    if USE_SUPABASE: lock_production_sql(con, production_id)
                     batch = con.execute("""SELECT * FROM production WHERE id=? AND order_id IS NULL
                       AND incubation_started_at<>''""", (production_id,)).fetchone()
                     if not batch: raise ValueError("Bulk production batch was not found.")
-                    if batch["quality_status"] != "incubating":
-                        raise ValueError("This batch already has a quality decision.")
-                    now = datetime.now().isoformat(timespec="seconds")
-                    if batch["incubation_due_at"] and now < batch["incubation_due_at"]:
-                        raise ValueError(f"This batch is incubating until {batch['incubation_due_at'].replace('T',' ')}.")
-                    if decision in ("rework", "trash") and batch["bulk_purpose"] == "stock":
+                    previous = batch["quality_status"]
+                    if payload.get("expected_status", previous) != previous:
+                        raise ValueError("Another person changed this status. Close and refresh before editing.")
+                    if decision != previous and (float(batch["bulk_allocated"]) > 0 or con.execute(
+                        "SELECT 1 FROM stock_packaging WHERE production_id=?", (production_id,)).fetchone() or con.execute(
+                        "SELECT 1 FROM production WHERE rework_of_id=?", (production_id,)).fetchone()):
+                        raise ValueError("Status is locked after packaging, allocation, or the start of a linked rework batch.")
+                    started, due = batch["incubation_started_at"], batch["incubation_due_at"]
+                    if decision == "incubating" and previous != decision:
+                        started, due = incubation_times(payload)
+                    elif due and (decision == "ready" or (previous == "incubating" and decision != previous)):
+                        deadline = datetime.fromisoformat(due)
+                        if datetime.now(deadline.tzinfo) < deadline:
+                            raise ValueError(f"This batch is incubating until {due.replace('T',' ')}.")
+                    if decision != "ready" and batch["bulk_purpose"] == "stock":
                         release_stock_need_sql(con, production_id, float(batch["gallons"]))
-                    con.execute("""UPDATE production SET quality_status=?,quality_decided_at=?,quality_decided_by=?,quality_notes=?
-                      WHERE id=?""", (decision, now, actor, notes, production_id))
+                    elif decision == "ready" and previous != "ready" and batch["bulk_purpose"] == "stock":
+                        allocate_stock_need_sql(con, production_id, batch["brand"],batch["color"],batch["unit"],batch["gallons"])
+                    cost = record_labor_sql(con,payload,production=batch,process_name="Quality Control",actor=actor)
+                    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    con.execute("""UPDATE production SET quality_status=?,quality_decided_at=?,quality_decided_by=?,quality_notes=?,
+                        incubation_started_at=?,incubation_due_at=? WHERE id=?""",
+                        (decision, now, actor, notes, started, due, production_id))
                     con.commit()
-                return self.send_json({"ok": True, "quality_status": decision}, 200)
+                return self.send_json({"ok": True, "quality_status": decision, "labor_cost":cost}, 200)
             if not self.require_role("add"): return
             if path == "/api/stock-needs":
                 brand=str(payload.get("brand","")).strip(); color=str(payload.get("color","")).strip()
@@ -2811,13 +2921,11 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/bulk-production":
                 brand = str(payload.get("brand", "")).strip(); color = str(payload.get("color", "")).strip()
                 batch = str(payload.get("batch_number", "")).strip(); amount = float(payload.get("gallons", payload.get("amount", 0)))
-                incubation_hours = float(payload.get("incubation_hours", 24))
+                started_text, due_text = incubation_times(payload)
                 rework_of_id = int(payload.get("rework_of_id", 0) or 0)
                 purpose = str(payload.get("purpose", "orders")).strip().lower()
-                if not brand or not color or not batch or amount <= 0:
+                if not brand or not color or not batch or not isfinite(amount) or amount <= 0:
                     raise ValueError("Select category and color, then enter a batch number and amount.")
-                if incubation_hours < 0 or incubation_hours > 720:
-                    raise ValueError("Incubation must be between 0 and 720 hours.")
                 if purpose not in ("orders", "stock"):
                     raise ValueError("Choose active-order demand or future stock.")
                 user = self.current_user(); actor = user.get("display_name") or user.get("email") or user.get("username", "")
@@ -2829,31 +2937,27 @@ class Handler(BaseHTTPRequestHandler):
                         prior = con.execute("""SELECT * FROM production WHERE id=? AND order_id IS NULL
                           AND incubation_started_at<>'' AND quality_status='rework'""", (rework_of_id,)).fetchone()
                         if not prior: raise ValueError("The original batch is not waiting for rework.")
+                        if con.execute("SELECT 1 FROM production WHERE rework_of_id=?", (rework_of_id,)).fetchone():
+                            raise ValueError("A linked rework batch already exists.")
                         if prior["brand"] != brand or prior["color"] != color or prior["unit"] != item["unit"]:
                             raise ValueError("Rework must keep the original category, color, and unit.")
                         if amount > float(prior["gallons"]) + .0001:
                             raise ValueError("Rework amount cannot exceed the original batch amount.")
                         purpose = prior["bulk_purpose"] or purpose
-                    if purpose == "orders":
-                        demand = next((row for row in bulk_demand_rows_sql(con)
-                                       if row["brand"] == brand and row["color"] == color and row["unit"] == item["unit"]), None)
-                        available = float(demand["remaining"]) if demand else 0.0
-                    else:
-                        available = sum(float(row["remaining"]) for row in stock_need_rows_sql(con)
-                                        if row["brand"] == brand and row["color"] == color and row["unit"] == item["unit"])
-                    if amount > available + .0001:
+                    demand = next((row for row in bulk_demand_rows_sql(con, purpose)
+                                   if row["brand"] == brand and row["color"] == color and row["unit"] == item["unit"]), None)
+                    available = float(demand["available_to_start"]) if demand else 0.0
+                    if not rework_of_id and amount > available + .0001:
                         label = "pieces" if item["unit"] == "qty" else "gallons"
                         raise ValueError(f"Only {available:.2f} {label} remain in the combined category demand.")
-                    started = datetime.now(); due = started + timedelta(hours=incubation_hours)
-                    started_text = started.isoformat(timespec="seconds"); due_text = due.isoformat(timespec="seconds")
                     cur = con.execute("""INSERT INTO production(order_id,brand,color,unit,batch_number,gallons,produced_at,
                       quality_status,incubation_started_at,incubation_due_at,bulk_purpose,rework_of_id)
                       VALUES(NULL,?,?,?,?,?,?,'incubating',?,?,?,?)""",
-                      (brand,color,item["unit"],batch,amount,started_text,started_text,due_text,purpose,rework_of_id or None))
+                      (brand,color,item["unit"],batch,amount,datetime.now().isoformat(timespec="seconds"),
+                       started_text,due_text,purpose,rework_of_id or None))
                     production = {"id": cur.lastrowid, "brand": brand, "color": color, "unit": item["unit"]}
-                    labor_cost = record_labor_sql(con,payload,production=production,process_name="Bulk Mixing / Production",actor=actor)
-                    if purpose == "stock":
-                        allocate_stock_need_sql(con,cur.lastrowid,brand,color,item["unit"],amount)
+                    labor_cost = record_labor_sql(con,payload,production=production,
+                        process_name="Batch Rework" if rework_of_id else "Bulk Mixing / Production",actor=actor)
                     con.commit()
                 return self.send_json({"ok": True, "id": cur.lastrowid, "quality_status": "incubating",
                                        "incubation_due_at": due_text, "labor_cost": labor_cost}, 201)
@@ -2880,7 +2984,7 @@ class Handler(BaseHTTPRequestHandler):
                 with closing(connect()) as con:
                     if source_type == "stock":
                         lock_production_sql(con, source_id)
-                        stock = con.execute("""SELECT p.*,p.gallons-COALESCE((SELECT SUM(k.gallons) FROM stock_packaging k WHERE k.production_id=p.id),0) available
+                        stock = con.execute("""SELECT p.*,p.gallons-p.bulk_allocated-COALESCE((SELECT SUM(k.gallons) FROM stock_packaging k WHERE k.production_id=p.id),0) available
                           FROM production p WHERE p.id=? AND p.order_id IS NULL""", (source_id,)).fetchone()
                         if not stock: raise ValueError("Stock production batch was not found.")
                         if stock["incubation_started_at"] and stock["quality_status"] != "ready":
@@ -3159,6 +3263,8 @@ class Handler(BaseHTTPRequestHandler):
                     lock_production_sql(con, record_id)
                     old=con.execute("SELECT * FROM production WHERE id=?",(record_id,)).fetchone()
                     if not old: raise ValueError("Batch was not found.")
+                    if old["incubation_started_at"]:
+                        raise ValueError("Manage QC batches on the Production page to preserve inventory and costing history.")
                     allocated=float(con.execute("SELECT COALESCE(SUM(amount),0) FROM stock_need_fulfillments WHERE production_id=?",(record_id,)).fetchone()[0])
                     stock_packaged=float(con.execute("SELECT COALESCE(SUM(gallons),0) FROM stock_packaging WHERE production_id=?",(record_id,)).fetchone()[0])
                     if gallons+.0001<stock_packaged: raise ValueError(f"Batch amount cannot be below {stock_packaged:.2f} already packaged.")
@@ -3232,9 +3338,11 @@ class Handler(BaseHTTPRequestHandler):
             with closing(connect()) as con:
                 if kind == "batches":
                     lock_production_sql(con, record_id)
-                    item = con.execute("""SELECT p.id,p.order_id,p.gallons,o.s_number
+                    item = con.execute("""SELECT p.id,p.order_id,p.gallons,p.incubation_started_at,o.s_number
                       FROM production p LEFT JOIN orders o ON o.id=p.order_id WHERE p.id=?""", (record_id,)).fetchone()
                     if not item: raise ValueError("Batch was not found.")
+                    if item["incubation_started_at"]:
+                        raise ValueError("Keep the QC history and cost: mark an unused batch Trash on the Production page instead.")
                     if item["order_id"] is None:
                         con.execute("DELETE FROM stock_packaging WHERE production_id=?", (record_id,))
                     else:
