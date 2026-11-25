@@ -125,6 +125,10 @@ try:
     dashboard, _ = ok("GET", "/api/dashboard", token=manager)
     pending = next(x for x in dashboard["bulk_demand"] if x["brand"] == "Bulk Test")
     assert pending["remaining"] == 10 and pending["available_to_start"] == 0
+    overview = ok("GET", "/api/dashboard-summary", token=manager)[0]
+    expected = {"brand":"Bulk Test","color":"Green","unit":"gallons","gallons":10}
+    assert overview["incubating"] == [expected]
+    assert expected in overview["daily"] and expected in overview["total"]
     assert not any(x.get("batch_number") == "BULK-QC-1" for x in dashboard["packageable"])
     assert call("POST", "/api/bulk-production", {"purpose": "orders", "brand": "Bulk Test", "color": "Green",
         "batch_number": "BULK-TOO-MUCH", "gallons": 1, "incubation_hours": 0, "rate_id": rate_id, "labor_hours": 0.1}, team)[0] == 400
@@ -153,6 +157,8 @@ try:
     event = ok("GET",history_path,token=manager)[0][0]
     assert (event["reason"],event["previous_status"],event["new_status"],event["decided_by"]) == ("QC confirmed early","incubating","ready","Manager")
     assert event["scheduled_due_at"] == edited["incubation_due_at"]
+    overview = ok("GET", "/api/dashboard-summary", token=manager)[0]
+    assert overview["incubating"] == [] and expected in overview["total"]
     dashboard, _ = ok("GET", "/api/dashboard", token=manager)
     assert next(x for x in dashboard["bulk_demand"] if x["brand"] == "Bulk Test")["remaining"] == 0
     bulk_source = next(x for x in dashboard["packageable"] if x.get("batch_number") == "BULK-QC-1")
@@ -198,6 +204,7 @@ try:
         "batch_number": "BULK-STOCK-QC", "gallons": 3, "incubation_hours": 0, "rate_id": rate_id, "labor_hours": 0.1}, team, 201)
     dashboard, _ = ok("GET", "/api/dashboard", token=manager)
     assert next(x for x in dashboard["stock_needs"] if x["note"] == "QC stock test")["remaining"] == 3
+    assert ok("GET","/api/dashboard-summary",token=manager)[0]["incubating"] == [{**expected,"gallons":3}]
     ok("POST", f"/api/bulk-production/{stock_qc['id']}/quality", {"decision": "ready"}, manager)
     dashboard, _ = ok("GET", "/api/dashboard", token=manager)
     assert next(x for x in dashboard["stock_needs"] if x["note"] == "QC stock test")["remaining"] == 0
@@ -500,6 +507,9 @@ try:
     assert b"PO# optional" in production_page and b"showOrderDetail" in dashboard_page and b"Active Orders by PO#" in dashboard_page
     assert b"buildPOGroups" in dashboard_page and b"showPOGroup" in dashboard_page and b"/api/dashboard-summary" in dashboard_page and b"Packaging Requirements" in dashboard_page
     assert b'orderSummaryMonth' in dashboard_page and b'orderSummaryProduced' in dashboard_page
+    assert all(label in dashboard_page for label in (
+        b"Total Gallons Needed", b"Gallons in Incubation", b"Total Gallons Produced", b"Gallons Produced Today"))
+    assert b'id="needQty"' not in dashboard_page and b'id="dayQty"' not in dashboard_page
     assert b'<th>Category</th><th>Color</th><th>Batch #' in call("GET", "/admin", token=admin)[1]
     assert b"Grouped by PO#" in reporting_page and b"This Month" in reporting_page and b'<option value="category">Category</option>' in reporting_page
     for route in ("/api/reports/category.csv", "/api/reports/labor.csv"):

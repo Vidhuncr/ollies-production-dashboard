@@ -1722,6 +1722,9 @@ def dashboard_summary_data():
           WHERE produced_at>=? AND produced_at<? GROUP BY brand,color,unit ORDER BY gallons DESC""", (today,tomorrow)).fetchall()]
         total = [dict(x) for x in con.execute("""SELECT brand,color,unit,ROUND(SUM(gallons-bulk_allocated),2) gallons FROM production
           GROUP BY brand,color,unit ORDER BY gallons DESC""").fetchall()]
+        incubating = [dict(x) for x in con.execute("""SELECT brand,color,unit,ROUND(SUM(gallons-bulk_allocated),2) gallons
+          FROM production WHERE unit='gallons' AND quality_status='incubating' AND order_id IS NULL
+          GROUP BY brand,color,unit HAVING SUM(gallons-bulk_allocated)>0 ORDER BY gallons DESC""").fetchall()]
         active_orders = [dict(x) for x in con.execute("""SELECT o.id,o.s_number,o.po_number,o.brand,o.color,o.gallons,o.unit,o.ship_month,o.created_at,
           ROUND(COALESCE((SELECT SUM(p.gallons) FROM production p WHERE p.order_id=o.id),0),2) produced,
           COALESCE((SELECT SUM(k.package_count-COALESCE((SELECT SUM(h.package_count) FROM shipments h WHERE h.packaging_id=k.id),0))
@@ -1761,7 +1764,7 @@ def dashboard_summary_data():
           SELECT k.package_count-COALESCE((SELECT SUM(h.package_count) FROM shipments h WHERE h.packaging_id=k.id),0) available_count FROM packaging k
           UNION ALL SELECT package_count FROM stock_packaging) WHERE available_count>0""").fetchone()[0]
         performance = production_performance_sql(con)
-    return {"performance":performance,"targets":performance["targets"],"need":need,"daily":daily,"total":total,
+    return {"performance":performance,"targets":performance["targets"],"need":need,"daily":daily,"total":total,"incubating":incubating,
             "active_orders":active_orders,"s_numbers":s_numbers,"active_inventory_packages":int(active_inventory_packages or 0),
             "package_types":package_type_data()}
 
