@@ -130,9 +130,29 @@ try:
         "batch_number": "BULK-TOO-MUCH", "gallons": 1, "incubation_hours": 0, "rate_id": rate_id, "labor_hours": 0.1}, team)[0] == 400
     assert call("POST", f"/api/bulk-production/{bulk_result['id']}/quality", {"decision": "ready"}, team)[0] == 403
     assert call("POST", f"/api/bulk-production/{bulk_result['id']}/quality", {"decision": "ready"}, manager)[0] == 400
-    with app.closing(app.connect()) as con:
-        con.execute("UPDATE production SET incubation_due_at='2000-01-01T00:00:00' WHERE id=?", (bulk_result["id"],)); con.commit()
-    ok("POST", f"/api/bulk-production/{bulk_result['id']}/quality", {"decision": "ready", "notes": "Passed QC"}, manager)
+    quality_path = f"/api/bulk-production/{bulk_result['id']}/quality"
+    history_path = f"/api/bulk-production/{bulk_result['id']}/overrides"
+    original = next(x for x in dashboard["incubation_batches"] if x["id"] == bulk_result["id"])
+    change_hours = {"decision":"incubating","update_incubation":True,"incubation_hours":0.5,
+                    "expected_due_at": original["incubation_due_at"]}
+    assert call("POST",quality_path,change_hours,team)[0] == 403
+    assert call("POST",quality_path,{**change_hours,"incubation_hours":721},manager)[0] == 400
+    edited = ok("POST",quality_path,change_hours,manager)[0]
+    assert app.datetime.fromisoformat(edited["incubation_due_at"])-app.datetime.fromisoformat(original["incubation_started_at"]) == app.timedelta(minutes=30)
+    assert call("POST",quality_path,change_hours,manager)[0] == 400
+    dashboard, _ = ok("GET","/api/dashboard",token=manager)
+    current = next(x for x in dashboard["incubation_batches"] if x["id"] == bulk_result["id"])
+    assert (current["incubation_started_at"],current["incubation_hours"]) == (original["incubation_started_at"],0.5)
+    assert not any(x.get("batch_number") == "BULK-QC-1" for x in dashboard["packageable"])
+    release = {"decision":"ready","notes":"Passed QC","expected_due_at":edited["incubation_due_at"]}
+    assert call("POST",quality_path,{**release,"override_incubation":True},manager)[0] == 400
+    assert call("POST",quality_path,{**release,"override_reason":"Missing explicit override"},manager)[0] == 400
+    assert call("POST",quality_path,{**release,"override_incubation":True,"override_reason":"QC confirmed early"},team)[0] == 403
+    assert ok("POST",quality_path,{**release,"override_incubation":True,"override_reason":"QC confirmed early"},manager)[0]["override_recorded"]
+    assert call("GET",history_path,token=team)[0] == 403
+    event = ok("GET",history_path,token=manager)[0][0]
+    assert (event["reason"],event["previous_status"],event["new_status"],event["decided_by"]) == ("QC confirmed early","incubating","ready","Manager")
+    assert event["scheduled_due_at"] == edited["incubation_due_at"]
     dashboard, _ = ok("GET", "/api/dashboard", token=manager)
     assert next(x for x in dashboard["bulk_demand"] if x["brand"] == "Bulk Test")["remaining"] == 0
     bulk_source = next(x for x in dashboard["packageable"] if x.get("batch_number") == "BULK-QC-1")
@@ -146,6 +166,8 @@ try:
     assert next(x for x in dashboard["incubation_batches"] if x["id"] == bulk_result["id"])["bulk_allocated"] == 10
     assert next(x for x in dashboard["total"] if x["brand"] == "Bulk Test")["gallons"] == 10
     assert call("POST", f"/api/bulk-production/{bulk_result['id']}/quality", {"decision": "trash"}, manager)[0] == 400
+    assert call("POST",quality_path,{"decision":"rework","override_incubation":True,"override_reason":"Locked batch"},manager)[0] == 400
+    assert len(ok("GET",history_path,token=manager)[0]) == 1
 
     trash_order, _ = ok("POST", "/api/orders", {"s_number": "S10997", "brand": "Bulk Test", "color": "Green",
         "gallons": 5, "ship_month": "2027-04"}, team, 201)
@@ -474,6 +496,7 @@ try:
     assert b"DAILY TARGET CRUSHED" in tv_page and b"targetState" in tv_page and b"/api/tv-dashboard" in tv_page
     assert b"labor cost" not in tv_page.lower() and b"Production Performance by Time Period" in dashboard_page
     assert b"Orders by Ship Month" in production_page and b'type="month"' in production_page
+    assert b"Override incubation" in production_page and b"Early override history" in production_page
     assert b"PO# optional" in production_page and b"showOrderDetail" in dashboard_page and b"Active Orders by PO#" in dashboard_page
     assert b"buildPOGroups" in dashboard_page and b"showPOGroup" in dashboard_page and b"/api/dashboard-summary" in dashboard_page and b"Packaging Requirements" in dashboard_page
     assert b'orderSummaryMonth' in dashboard_page and b'orderSummaryProduced' in dashboard_page

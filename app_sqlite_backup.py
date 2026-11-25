@@ -648,6 +648,18 @@ ALTER TABLE production ADD COLUMN IF NOT EXISTS quality_notes TEXT NOT NULL DEFA
 ALTER TABLE production ADD COLUMN IF NOT EXISTS bulk_purpose TEXT NOT NULL DEFAULT '';
 ALTER TABLE production ADD COLUMN IF NOT EXISTS bulk_allocated NUMERIC NOT NULL DEFAULT 0;
 ALTER TABLE production ADD COLUMN IF NOT EXISTS rework_of_id BIGINT REFERENCES production(id);
+CREATE TABLE IF NOT EXISTS production_qc_overrides (
+  id BIGSERIAL PRIMARY KEY,
+  production_id BIGINT NOT NULL REFERENCES production(id),
+  previous_status TEXT NOT NULL,
+  new_status TEXT NOT NULL,
+  scheduled_due_at TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  decided_by TEXT NOT NULL,
+  decided_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_production_qc_overrides_batch ON production_qc_overrides(production_id,id);
+ALTER TABLE production_qc_overrides ENABLE ROW LEVEL SECURITY;
 CREATE TABLE IF NOT EXISTS catalog (
   id BIGSERIAL PRIMARY KEY,
   category TEXT NOT NULL,
@@ -1177,6 +1189,13 @@ def initialize():
             if column not in production_columns:
                 con.execute(f"ALTER TABLE production ADD COLUMN {column} {definition}")
         con.execute("CREATE INDEX IF NOT EXISTS idx_production_quality ON production(quality_status,incubation_due_at)")
+        con.execute("""CREATE TABLE IF NOT EXISTS production_qc_overrides (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          production_id INTEGER NOT NULL REFERENCES production(id),
+          previous_status TEXT NOT NULL, new_status TEXT NOT NULL, scheduled_due_at TEXT NOT NULL,
+          reason TEXT NOT NULL, decided_by TEXT NOT NULL, decided_at TEXT NOT NULL
+        )""")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_production_qc_overrides_batch ON production_qc_overrides(production_id,id)")
         remove_provisional_stock_credit_sql(con)
         con.commit()
 
@@ -1273,7 +1292,7 @@ def bulk_demand_rows_sql(con, purpose="orders"):
 
 
 def incubation_batches_sql(con):
-    return [dict(row) for row in con.execute("""SELECT p.id,p.batch_number,p.brand,p.color,p.unit,p.gallons,
+    rows = [dict(row) for row in con.execute("""SELECT p.id,p.batch_number,p.brand,p.color,p.unit,p.gallons,
       p.produced_at,p.quality_status,p.incubation_started_at,p.incubation_due_at,p.quality_decided_at,
       p.quality_decided_by,p.quality_notes,p.bulk_purpose,p.rework_of_id,
       p.bulk_allocated,
@@ -1282,6 +1301,12 @@ def incubation_batches_sql(con):
       FROM production p WHERE p.order_id IS NULL AND p.incubation_started_at<>''
       ORDER BY CASE p.quality_status WHEN 'incubating' THEN 0 WHEN 'rework' THEN 1 WHEN 'ready' THEN 2 ELSE 3 END,
       p.produced_at DESC,p.id DESC LIMIT 250""").fetchall()]
+    for row in rows:
+        started = incubation_datetime(row["incubation_started_at"])
+        due = incubation_datetime(row["incubation_due_at"])
+        row["incubation_hours"] = round(max((due-started).total_seconds()/3600,0),4) if started and due else None
+        row["incubation_due_utc"] = due.isoformat() if due else ""
+    return rows
 
 
 def eligible_legacy_batches_sql(con, search=""):
@@ -1294,11 +1319,18 @@ def eligible_legacy_batches_sql(con, search=""):
       ORDER BY p.produced_at DESC,p.id DESC LIMIT 100""", ("%"+search.lower()+"%",)).fetchall()]
 
 
-def incubation_times(payload):
+def incubation_datetime(value):
+    try:
+        return datetime.fromisoformat(value).astimezone(timezone.utc) if value else None
+    except ValueError:
+        return None
+
+
+def incubation_times(payload, started=None):
     hours = float(payload.get("incubation_hours", 24))
     if not isfinite(hours) or not 0 <= hours <= 720:
         raise ValueError("Incubation must be between 0 and 720 hours.")
-    started = datetime.now(timezone.utc)
+    started = started if started is not None else datetime.now(timezone.utc)
     return started.isoformat(timespec="seconds"), (started+timedelta(hours=hours)).isoformat(timespec="seconds")
 
 
@@ -2349,6 +2381,14 @@ class Handler(BaseHTTPRequestHandler):
             search = parse_qs(urlparse(self.path).query).get("q", [""])[0][:100]
             with closing(connect()) as con:
                 return self.send_json(eligible_legacy_batches_sql(con, search))
+        override_match = re.fullmatch(r"/api/bulk-production/(\d+)/overrides", path)
+        if override_match:
+            if not self.require_role("edit"): return
+            with closing(connect()) as con:
+                rows = con.execute("""SELECT previous_status,new_status,scheduled_due_at,reason,decided_by,decided_at
+                  FROM production_qc_overrides WHERE production_id=? ORDER BY id DESC LIMIT 20""",
+                  (int(override_match.group(1)),)).fetchall()
+                return self.send_json([dict(row) for row in rows])
         detail_match = re.fullmatch(r"/api/s-numbers/([^/]+)/detail", path)
         if detail_match:
             if not self.authorized(): return
@@ -2808,6 +2848,9 @@ class Handler(BaseHTTPRequestHandler):
                 production_id = int(quality_match.group(1))
                 decision = str(payload.get("decision", "")).strip().lower()
                 notes = str(payload.get("notes", "")).strip()
+                override = payload.get("override_incubation") is True
+                reason = str(payload.get("override_reason") or "").strip()
+                edit_timer = payload.get("update_incubation") is True
                 if decision not in ("incubating", "ready", "rework", "trash"):
                     raise ValueError("Select a valid QC status.")
                 actor = user.get("display_name") or user.get("email") or user.get("username", "")
@@ -2818,30 +2861,47 @@ class Handler(BaseHTTPRequestHandler):
                       AND incubation_started_at<>''""", (production_id,)).fetchone()
                     if not batch: raise ValueError("Bulk production batch was not found.")
                     previous = batch["quality_status"]
-                    if payload.get("expected_status", previous) != previous:
-                        raise ValueError("Another person changed this status. Close and refresh before editing.")
-                    if decision != previous and (float(batch["bulk_allocated"]) > 0 or con.execute(
+                    started, due = batch["incubation_started_at"], batch["incubation_due_at"]
+                    if payload.get("expected_status", previous) != previous or payload.get("expected_due_at", due) != due:
+                        raise ValueError("Another person changed this batch's status or timer. Close and refresh before editing.")
+                    if edit_timer and (previous != "incubating" or decision != "incubating"):
+                        raise ValueError("To edit the timer, keep the status set to Incubating.")
+                    if (decision != previous or edit_timer) and (float(batch["bulk_allocated"]) > 0 or con.execute(
                         "SELECT 1 FROM stock_packaging WHERE production_id=?", (production_id,)).fetchone() or con.execute(
                         "SELECT 1 FROM production WHERE rework_of_id=?", (production_id,)).fetchone()):
                         raise ValueError("Status is locked after packaging, allocation, or the start of a linked rework batch.")
-                    started, due = batch["incubation_started_at"], batch["incubation_due_at"]
+                    early = False
                     if decision == "incubating" and previous != decision:
                         started, due = incubation_times(payload)
-                    elif due and (decision == "ready" or (previous == "incubating" and decision != previous)):
-                        deadline = datetime.fromisoformat(due)
-                        if datetime.now(deadline.tzinfo) < deadline:
-                            raise ValueError(f"This batch is incubating until {due.replace('T',' ')}.")
-                    if decision != "ready" and batch["bulk_purpose"] == "stock":
+                    elif edit_timer:
+                        original_start = incubation_datetime(started)
+                        if not original_start: raise ValueError("This batch has no valid incubation start.")
+                        _, due = incubation_times(payload, original_start)
+                    elif decision != previous:
+                        deadline = incubation_datetime(due)
+                        if not deadline: raise ValueError("Set a valid incubation timer before recording a QC decision.")
+                        early = bool(deadline and datetime.now(timezone.utc) < deadline)
+                        if early and (not override or not reason):
+                            raise ValueError("Incubation is not finished. Select Override incubation and enter a reason to change the status early.")
+                        if early and len(reason) > 500:
+                            raise ValueError("Keep the override reason to 500 characters or fewer.")
+                    if decision != "ready" and previous == "ready" and batch["bulk_purpose"] == "stock":
                         release_stock_need_sql(con, production_id, float(batch["gallons"]))
                     elif decision == "ready" and previous != "ready" and batch["bulk_purpose"] == "stock":
                         allocate_stock_need_sql(con, production_id, batch["brand"],batch["color"],batch["unit"],batch["gallons"])
                     cost = record_labor_sql(con,payload,production=batch,process_name="Quality Control",actor=actor)
                     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    if early:
+                        con.execute("""INSERT INTO production_qc_overrides
+                          (production_id,previous_status,new_status,scheduled_due_at,reason,decided_by,decided_at)
+                          VALUES(?,?,?,?,?,?,?)""", (production_id,previous,decision,due,reason,actor,now))
                     con.execute("""UPDATE production SET quality_status=?,quality_decided_at=?,quality_decided_by=?,quality_notes=?,
                         incubation_started_at=?,incubation_due_at=? WHERE id=?""",
-                        (decision, now, actor, notes, started, due, production_id))
+                        (decision, now if decision != previous else batch["quality_decided_at"],
+                         actor if decision != previous else batch["quality_decided_by"], notes, started, due, production_id))
                     con.commit()
-                return self.send_json({"ok": True, "quality_status": decision, "labor_cost":cost}, 200)
+                return self.send_json({"ok": True, "quality_status": decision, "incubation_due_at":due,
+                                       "override_recorded":early, "labor_cost":cost}, 200)
             if not self.require_role("add"): return
             if path == "/api/stock-needs":
                 brand=str(payload.get("brand","")).strip(); color=str(payload.get("color","")).strip()
