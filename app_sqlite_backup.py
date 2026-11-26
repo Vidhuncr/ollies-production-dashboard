@@ -27,6 +27,7 @@ from queue import Empty, Full, LifoQueue
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 try:
     import psycopg
@@ -65,6 +66,10 @@ def bounded_env_number(name, default, minimum, maximum, as_float=False):
 
 
 load_local_env()
+try:
+    PLANT_CLOCK = ZoneInfo(os.environ.get("PLANT_TIMEZONE", "America/Chicago"))
+except ZoneInfoNotFoundError:
+    PLANT_CLOCK = None  # Use the host's local clock if timezone data is unavailable.
 SUPABASE_DATABASE_URL = (os.environ.get("SUPABASE_DATABASE_URL") or os.environ.get("DATABASE_URL") or "").strip()
 USE_SUPABASE = bool(SUPABASE_DATABASE_URL)
 APP_USERNAME = os.environ.get("APP_USERNAME", "admin")
@@ -641,6 +646,8 @@ CREATE TABLE IF NOT EXISTS production (
 );
 ALTER TABLE production ADD COLUMN IF NOT EXISTS quality_status TEXT NOT NULL DEFAULT 'ready';
 ALTER TABLE production ADD COLUMN IF NOT EXISTS incubation_started_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE production ADD COLUMN IF NOT EXISTS first_incubated_day TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_production_first_incubated ON production(first_incubated_day) WHERE first_incubated_day<>'';
 ALTER TABLE production ADD COLUMN IF NOT EXISTS incubation_due_at TEXT NOT NULL DEFAULT '';
 ALTER TABLE production ADD COLUMN IF NOT EXISTS quality_decided_at TEXT NOT NULL DEFAULT '';
 ALTER TABLE production ADD COLUMN IF NOT EXISTS quality_decided_by TEXT NOT NULL DEFAULT '';
@@ -861,6 +868,7 @@ def initialize_supabase():
             if statement.strip():
                 con.execute(statement)
         remove_provisional_stock_credit_sql(con)
+        backfill_incubation_days_sql(con)
         if not con.execute("SELECT 1 FROM users WHERE role='admin' AND active=1").fetchone():
             seed_email = APP_ADMIN_EMAIL if valid_email(APP_ADMIN_EMAIL) else (APP_USERNAME.lower() if valid_email(APP_USERNAME) else "")
             seed_username = seed_email or APP_USERNAME
@@ -1178,6 +1186,7 @@ def initialize():
         for column, definition in (
             ("quality_status", "TEXT NOT NULL DEFAULT 'ready'"),
             ("incubation_started_at", "TEXT NOT NULL DEFAULT ''"),
+            ("first_incubated_day", "TEXT NOT NULL DEFAULT ''"),
             ("incubation_due_at", "TEXT NOT NULL DEFAULT ''"),
             ("quality_decided_at", "TEXT NOT NULL DEFAULT ''"),
             ("quality_decided_by", "TEXT NOT NULL DEFAULT ''"),
@@ -1189,6 +1198,7 @@ def initialize():
             if column not in production_columns:
                 con.execute(f"ALTER TABLE production ADD COLUMN {column} {definition}")
         con.execute("CREATE INDEX IF NOT EXISTS idx_production_quality ON production(quality_status,incubation_due_at)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_production_first_incubated ON production(first_incubated_day) WHERE first_incubated_day<>''")
         con.execute("""CREATE TABLE IF NOT EXISTS production_qc_overrides (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           production_id INTEGER NOT NULL REFERENCES production(id),
@@ -1197,6 +1207,7 @@ def initialize():
         )""")
         con.execute("CREATE INDEX IF NOT EXISTS idx_production_qc_overrides_batch ON production_qc_overrides(production_id,id)")
         remove_provisional_stock_credit_sql(con)
+        backfill_incubation_days_sql(con)
         con.commit()
 
 
@@ -1326,6 +1337,21 @@ def incubation_datetime(value):
         return None
 
 
+def plant_day(stamp=None):
+    instant = datetime.fromisoformat(stamp) if stamp else datetime.now(PLANT_CLOCK)
+    return instant.astimezone(PLANT_CLOCK).date()
+
+
+def backfill_incubation_days_sql(con):
+    for row in con.execute("""SELECT id,incubation_started_at FROM production
+      WHERE first_incubated_day='' AND incubation_started_at<>''""").fetchall():
+        try:
+            day = plant_day(row["incubation_started_at"]).isoformat()
+        except ValueError:
+            continue
+        con.execute("UPDATE production SET first_incubated_day=? WHERE id=? AND first_incubated_day=''", (day,row["id"]))
+
+
 def incubation_times(payload, started=None):
     hours = float(payload.get("incubation_hours", 24))
     if not isfinite(hours) or not 0 <= hours <= 720:
@@ -1438,13 +1464,14 @@ def _target_plan_sql(con, start, end, defaults):
     return {key: round(value, 2) for key, value in result.items()}
 
 
-def _today_target_breakdown_sql(con, target_date, defaults):
+def _today_target_breakdown_sql(con, target_date, defaults, actual=None):
     rows = [dict(x) for x in con.execute("""SELECT id,target_date,brand,color,unit,amount,updated_at,updated_by
       FROM daily_production_targets WHERE target_date=? AND amount>0 ORDER BY unit,brand,color,id""", (target_date,)).fetchall()]
-    actual_rows = con.execute("""SELECT brand,color,unit,ROUND(SUM(gallons-bulk_allocated),2) amount FROM production
-      WHERE produced_at>=? AND produced_at<? GROUP BY brand,color,unit""",
-      (target_date, (date.fromisoformat(target_date)+timedelta(days=1)).isoformat())).fetchall()
-    actual = {(x["brand"],x["color"],x["unit"]): float(x["amount"]) for x in actual_rows}
+    if actual is None:
+        actual_rows = con.execute("""SELECT brand,color,unit,ROUND(SUM(gallons-bulk_allocated),2) amount FROM production
+          WHERE produced_at>=? AND produced_at<? GROUP BY brand,color,unit""",
+          (target_date, (date.fromisoformat(target_date)+timedelta(days=1)).isoformat())).fetchall()
+        actual = {(x["brand"],x["color"],x["unit"]): float(x["amount"]) for x in actual_rows}
     result = []
     for unit in ("gallons", "qty"):
         unit_rows = [x for x in rows if x["unit"] == unit]
@@ -1469,8 +1496,8 @@ def _today_target_breakdown_sql(con, target_date, defaults):
     return result
 
 
-def production_performance_sql(con):
-    today_value = date.today(); tomorrow_value = today_value + timedelta(days=1)
+def production_performance_sql(con, *, today=None, target_actual=None):
+    today_value = today or date.today(); tomorrow_value = today_value + timedelta(days=1)
     target_row = con.execute("SELECT daily_gallons,daily_qty,updated_at,updated_by FROM production_targets WHERE id=1").fetchone()
     defaults = {
       "daily_gallons": float(target_row["daily_gallons"]) if target_row else 0.0,
@@ -1506,7 +1533,7 @@ def production_performance_sql(con):
     today_targets = _target_plan_sql(con,today_value,tomorrow_value,defaults)
     targets = {**defaults, "daily_gallons": today_targets["gallons"], "daily_qty": today_targets["qty"]}
     return {"periods": periods, "daily_history": list(by_day.values()), "category_mix": mix, "targets": targets,
-            "target_breakdown": _today_target_breakdown_sql(con,today_value.isoformat(),defaults)}
+            "target_breakdown": _today_target_breakdown_sql(con,today_value.isoformat(),defaults,target_actual)}
 
 
 def dashboard_data():
@@ -1684,14 +1711,13 @@ def dashboard_data():
 
 
 def _order_schedule_sql(con):
-    current_month = date.today().isoformat()[:7]
     rows = con.execute("""SELECT o.id,o.s_number,o.po_number,o.brand,o.color,o.unit,o.gallons,o.ship_month,o.created_at,
       ROUND(COALESCE(SUM(p.gallons),0),2) produced,
       ROUND(CASE WHEN o.gallons-COALESCE(SUM(p.gallons),0)>0 THEN o.gallons-COALESCE(SUM(p.gallons),0) ELSE 0 END,2) remaining,
       s.ready_at,s.shipped_at FROM orders o LEFT JOIN production p ON p.order_id=o.id
-      LEFT JOIN s_number_status s ON s.s_number=o.s_number WHERE s.shipped_at IS NULL OR o.ship_month>=?
+      LEFT JOIN s_number_status s ON s.s_number=o.s_number WHERE s.shipped_at IS NULL
       GROUP BY o.id,s.ready_at,s.shipped_at
-      ORDER BY CASE WHEN o.ship_month='' THEN 1 ELSE 0 END,o.ship_month,o.s_number,o.id""", (current_month,)).fetchall()
+      ORDER BY CASE WHEN o.ship_month='' THEN 1 ELSE 0 END,o.ship_month,o.s_number,o.id""").fetchall()
     result = []
     for raw in rows:
         row = dict(raw)
@@ -1701,9 +1727,44 @@ def _order_schedule_sql(con):
 
 
 def tv_dashboard_data():
-    """Small public payload for the floor TV; avoids loading inventory, shipping, and costing records."""
+    """The floor goal counts a batch once, when it first enters incubation."""
     with closing(connect()) as con:
-        return {"performance": production_performance_sql(con), "order_schedule": _order_schedule_sql(con)}
+        today = plant_day()
+        daily = {}
+        today_by_product = {}
+        for row in con.execute("""SELECT first_incubated_day,brand,color,SUM(gallons) amount FROM production
+          WHERE first_incubated_day>=? AND first_incubated_day<=? AND unit='gallons'
+          GROUP BY first_incubated_day,brand,color""", ((today-timedelta(days=59)).isoformat(),today.isoformat())).fetchall():
+            day, amount = row["first_incubated_day"], float(row["amount"])
+            daily[day] = daily.get(day, 0) + amount
+            if day == today.isoformat():
+                today_by_product[(row["brand"],row["color"],"gallons")] = amount
+        lifetime = float(con.execute("""SELECT COALESCE(SUM(gallons),0) FROM production
+          WHERE unit='gallons' AND first_incubated_day<>'' AND first_incubated_day<=?""", (today.isoformat(),)).fetchone()[0])
+        performance = production_performance_sql(con,today=today,target_actual=today_by_product)
+        performance["time_zone"] = PLANT_CLOCK.key if PLANT_CLOCK else ""
+        def range_total(start, days):
+            return round(sum(daily.get((start+timedelta(days=i)).isoformat(),0) for i in range(days)),2)
+        for period in performance["periods"]:
+            days = period["target"]["days"]
+            if days:
+                start = date.fromisoformat(period["start"])
+                period["current"]["incubated_gallons"] = range_total(start,days)
+                period["previous"]["incubated_gallons"] = range_total(start-timedelta(days=days),days)
+            else:
+                period["current"]["incubated_gallons"] = round(lifetime,2)
+            # Keep labor and internal statistics out of the public floor payload.
+            for key in ("current","previous"):
+                if period[key] is not None:
+                    period[key] = {k:v for k,v in period[key].items()
+                                   if k in ("incubated_gallons","produced_gallons","packages")}
+        for row in performance["daily_history"]:
+            row["incubated_gallons"] = round(daily.get(row["day"],0),2)
+        performance["target_breakdown"] = [
+            {**{k:x[k] for k in ("brand","color","unit","amount","percent","achieved")}, "incubated":x["produced"]}
+            for x in performance["target_breakdown"] if x["unit"]=="gallons" and performance["targets"]["daily_gallons"]>0
+        ]
+        return {"performance":performance,"order_schedule":_order_schedule_sql(con)}
 
 
 def dashboard_summary_data():
@@ -2841,7 +2902,8 @@ class Handler(BaseHTTPRequestHandler):
                         con.execute("UPDATE labor_entries SET order_id=NULL,s_number='STOCK' WHERE production_id=?", (production_id,))
                     release_stock_need_sql(con, production_id, float(old["gallons"]))
                     con.execute("""UPDATE production SET order_id=NULL,bulk_purpose='orders',quality_status='incubating',
-                        incubation_started_at=?,incubation_due_at=? WHERE id=?""", (started,due,production_id))
+                        incubation_started_at=?,incubation_due_at=?,first_incubated_day=? WHERE id=?""",
+                        (started,due,plant_day(started).isoformat(),production_id))
                     con.commit()
                 return self.send_json({"ok":True,"quality_status":"incubating","incubation_due_at":due})
             quality_match = re.fullmatch(r"/api/bulk-production/(\d+)/quality", path)
@@ -3017,10 +3079,10 @@ class Handler(BaseHTTPRequestHandler):
                         label = "pieces" if item["unit"] == "qty" else "gallons"
                         raise ValueError(f"Only {available:.2f} {label} remain in the combined category demand.")
                     cur = con.execute("""INSERT INTO production(order_id,brand,color,unit,batch_number,gallons,produced_at,
-                      quality_status,incubation_started_at,incubation_due_at,bulk_purpose,rework_of_id)
-                      VALUES(NULL,?,?,?,?,?,?,'incubating',?,?,?,?)""",
+                      quality_status,incubation_started_at,incubation_due_at,first_incubated_day,bulk_purpose,rework_of_id)
+                      VALUES(NULL,?,?,?,?,?,?,'incubating',?,?,?,?,?)""",
                       (brand,color,item["unit"],batch,amount,datetime.now().isoformat(timespec="seconds"),
-                       started_text,due_text,purpose,rework_of_id or None))
+                       started_text,due_text,plant_day(started_text).isoformat(),purpose,rework_of_id or None))
                     production = {"id": cur.lastrowid, "brand": brand, "color": color, "unit": item["unit"]}
                     labor_cost = record_labor_sql(con,payload,production=production,
                         process_name="Batch Rework" if rework_of_id else "Bulk Mixing / Production",actor=actor)

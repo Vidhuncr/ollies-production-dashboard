@@ -129,6 +129,9 @@ try:
     expected = {"brand":"Bulk Test","color":"Green","unit":"gallons","gallons":10}
     assert overview["incubating"] == [expected]
     assert expected in overview["daily"] and expected in overview["total"]
+    floor = ok("GET", "/api/tv-dashboard")[0]["performance"]
+    assert floor["periods"][0]["current"]["incubated_gallons"] == 10
+    assert floor["daily_history"][-1]["incubated_gallons"] == 10
     assert not any(x.get("batch_number") == "BULK-QC-1" for x in dashboard["packageable"])
     assert call("POST", "/api/bulk-production", {"purpose": "orders", "brand": "Bulk Test", "color": "Green",
         "batch_number": "BULK-TOO-MUCH", "gallons": 1, "incubation_hours": 0, "rate_id": rate_id, "labor_hours": 0.1}, team)[0] == 400
@@ -159,6 +162,7 @@ try:
     assert event["scheduled_due_at"] == edited["incubation_due_at"]
     overview = ok("GET", "/api/dashboard-summary", token=manager)[0]
     assert overview["incubating"] == [] and expected in overview["total"]
+    assert ok("GET","/api/tv-dashboard")[0]["performance"]["periods"][0]["current"]["incubated_gallons"] == 10
     dashboard, _ = ok("GET", "/api/dashboard", token=manager)
     assert next(x for x in dashboard["bulk_demand"] if x["brand"] == "Bulk Test")["remaining"] == 0
     bulk_source = next(x for x in dashboard["packageable"] if x.get("batch_number") == "BULK-QC-1")
@@ -485,6 +489,14 @@ try:
     tv_fast, _ = ok("GET", "/api/tv-dashboard")
     summary_fast, _ = ok("GET", "/api/dashboard-summary", token=admin)
     assert set(tv_fast) == {"performance", "order_schedule"}
+    floor_today = next(x for x in tv_fast["performance"]["periods"] if x["key"] == "today")
+    assert floor_today["current"]["incubated_gallons"] == 30  # Reopening a batch and order allocation do not double count it.
+    assert "labor_cost" not in floor_today["current"]
+    assert not any(x["status"] == "Shipped" for x in tv_fast["order_schedule"])
+    if app.plant_day().isoformat() == target_day:
+        goals = tv_fast["performance"]["target_breakdown"]
+        assert len(goals) == 1 and goals[0]["unit"] == "gallons" and goals[0]["amount"] == 10
+        assert goals[0]["incubated"] == 30 and goals[0]["achieved"]
     assert "active_inventory_packages" in summary_fast and "inventory" not in summary_fast
     active_lines = summary_fast["active_orders"]
     assert [x["ship_month"] or "9999-99" for x in active_lines] == sorted(x["ship_month"] or "9999-99" for x in active_lines)
@@ -501,6 +513,7 @@ try:
     reporting_page = call("GET", "/reporting", token=admin)[1]
     assert b"Changes every 15 seconds" in tv_page and b"14-Day Production Trend" in tv_page
     assert b"DAILY TARGET CRUSHED" in tv_page and b"targetState" in tv_page and b"/api/tv-dashboard" in tv_page
+    assert b"scheduleGroups" in tv_page and b"scheduleTable" not in tv_page and b"gal incubated" in tv_page
     assert b"labor cost" not in tv_page.lower() and b"Production Performance by Time Period" in dashboard_page
     assert b"Orders by Ship Month" in production_page and b'type="month"' in production_page
     assert b"Override incubation" in production_page and b"Early override history" in production_page
